@@ -1,1 +1,4 @@
 .env
+venv/
+classification/data/
+classification/models/
