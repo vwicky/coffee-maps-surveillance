@@ -1,1 +1,4 @@
 .env
+detection/detections
+detection/saved_people
+detection/vid
