@@ -14,13 +14,17 @@ import numpy as np
 from util_classes import SexEnum, ClassificationResult, ClassificationMetadata
 from faiss_index_manager import FaissIndexManager
 from metadata_manager import MetadataManager
+
+# subclassifier models
 from sub_classifiers.race_classifier import RaceClassifier
+from sub_classifiers.famous_classifier import FamousClassifier
 
 class FaceClassifier:
     def __init__(self, 
                  ctx_id=-1, #cpu
                  det_size=(640, 640), 
-                 race_model_path= None, 
+                 race_model_path = None, 
+                 famous_model_path = None,
                  load_previous_faces: bool = False # path to faiss index file
                  ):
         self.app = FaceAnalysis()
@@ -44,8 +48,13 @@ class FaceClassifier:
             
         # loading Race model
         self.race_model_path = race_model_path
-        if race_model_path:
-            self.race_model = RaceClassifier(model_path=race_model_path)
+        if self.race_model_path:
+            self.race_model = RaceClassifier(model_path=self.race_model_path)
+            
+        # loading Famous People model
+        self.famous_model_path = famous_model_path
+        if self.famous_model_path:
+            self.famous_model = FamousClassifier(model_path=self.famous_model_path)
             
     def person_with_id(self, id: int) -> ClassificationResult:
         data = self.metadata_manager.get_by_id(id)
@@ -69,7 +78,12 @@ class FaceClassifier:
         if self.race_model_path is None:
             return "unknown", 0.0
 
-        return self.race_model.predict_race(face, img, ensemble, threshold)
+        return self.race_model.predict(face, img, ensemble, threshold)
+    
+    def detect_famous(self, img) -> str:
+        if self.famous_model_path is None:
+            return "unknown", 0.0
+        return self.famous_model.predict(img)
 
     def detect_gender(self, face) -> str:
         return SexEnum.MALE if face.gender == 1 else SexEnum.FEMALE
@@ -86,7 +100,11 @@ class FaceClassifier:
         age = self.detect_age(face)
         race = self.detect_race(face, img)
         
-        return ClassificationResult(age, gender, race)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # convert to RGB
+        img_pil = Image.fromarray(img)             # now PIL Image
+        famous = self.detect_famous(img_pil)
+        
+        return ClassificationResult(age, gender, race, famous)
 
     def draw_face(self, face, img, cl_result):
         # draw rctangle

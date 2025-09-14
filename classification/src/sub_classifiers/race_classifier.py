@@ -6,7 +6,9 @@ import numpy as np
 from torchvision import transforms
 from transformers import AutoFeatureExtractor, AutoModelForImageClassification
 
-class RaceClassifier:
+from .i_classifier import Classifier
+
+class RaceClassifier(Classifier):
     def __init__(self, model_path: str):
         self.model_path = model_path
 
@@ -26,7 +28,7 @@ class RaceClassifier:
         # Map numeric labels to names
         self.race_labels = self.race_model.config.id2label
         
-    def predict_race(self, face, img, ensemble=True, threshold=0.5):
+    def predict(self, face, img, ensemble=True, threshold=0.5):
         """
         Predict race for a detected face using landmarks-aware cropping and optional ensemble.
             Landmark-aware crop → reduces background noise.

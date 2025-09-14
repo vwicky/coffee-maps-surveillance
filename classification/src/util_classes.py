@@ -10,6 +10,8 @@ class ClassificationResult:
     sex: str = ""
     race: str = ""
     
+    famous: str = ""
+    
 @dataclass
 class ClassificationMetadata:
     classification_result: ClassificationResult
