@@ -1,1 +1,5 @@
 .env
+venv/
+classification/data/
+classification/models/
+classification/faiss_index
