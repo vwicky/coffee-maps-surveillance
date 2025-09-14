@@ -9,15 +9,25 @@ from torchvision import transforms
 from transformers import AutoFeatureExtractor, AutoModelForImageClassification
 import faiss
 import numpy as np
+from dotenv import load_dotenv
+import os
 
 # our modules
-from util_classes import SexEnum, ClassificationResult, ClassificationMetadata
+from util_classes import SexEnum, ClassificationResult, ClassificationMetadata, AdditionalMetadata
 from faiss_index_manager import FaissIndexManager
 from metadata_manager import MetadataManager
 
 # subclassifier models
 from sub_classifiers.race_classifier import RaceClassifier
 from sub_classifiers.famous_classifier import FamousClassifier
+
+from metadata_mongo_manager import MongoMetadataManager
+
+# Load environment variables from .env file
+load_dotenv()
+
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "general_db")  # fallback
 
 class FaceClassifier:
     def __init__(self, 
@@ -46,6 +56,9 @@ class FaceClassifier:
             )
             self.metadata_manager = MetadataManager(metadata=None)
             
+        # adding mongodb
+        self.mongo_metadata_manager = MongoMetadataManager(mongo_uri=MONGO_URI, db_name=MONGO_DB)
+            
         # loading Race model
         self.race_model_path = race_model_path
         if self.race_model_path:
@@ -55,6 +68,41 @@ class FaceClassifier:
         self.famous_model_path = famous_model_path
         if self.famous_model_path:
             self.famous_model = FamousClassifier(model_path=self.famous_model_path)
+            
+    def analyze_face_on_frame(self, img, session_id, frame_number=None):
+        """ analyses frame and saves info in a mongodb """
+        results = []
+        
+        faces = self.app.get(img)
+        for face in faces:
+            embedding = face.normed_embedding.astype("float32").reshape(1, -1)
+            
+            # check FAISS
+            existing_id = self.face_fid.check_if_present(embedding)
+            if existing_id is not None:
+                continue  # already seen
+
+            # classify new face
+            result = self.detect_(face, img)
+
+            # add to FAISS and Mongo
+            embedding_id = self.face_fid.add_embedding(embedding, metadata_idx=frame_number)
+            face_id = f"{session_id}_frame{frame_number}_face{embedding_id}"
+            
+            additional_metadata = AdditionalMetadata(
+                frame_number=frame_number, bbox=face.bbox.tolist()
+            )
+            metadata = ClassificationMetadata(
+                session_id=session_id,
+                face_id=face_id,
+                embedding_id=embedding_id,
+                classification_result=result,
+                additional_metadata=additional_metadata
+            )
+            
+            self.mongo_metadata_manager.add_face(metadata)
+            results.append(metadata)
+        return results
             
     def person_with_id(self, id: int) -> ClassificationResult:
         data = self.metadata_manager.get_by_id(id)

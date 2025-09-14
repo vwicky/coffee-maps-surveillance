@@ -13,6 +13,17 @@ class ClassificationResult:
     famous: str = ""
     
 @dataclass
+class AdditionalMetadata:
+    frame_number: int
+    bbox: list
+    
+@dataclass
 class ClassificationMetadata:
+    session_id: str
+    face_id: str
+    embedding_id: str
+    
     classification_result: ClassificationResult
-    idx: int
+    additional_metadata: AdditionalMetadata
+    # old field
+    idx: int = 0
