@@ -11,17 +11,18 @@ import faiss
 import numpy as np
 from dotenv import load_dotenv
 import os
+from dataclasses import asdict
 
 # our modules
-from util_classes import SexEnum, ClassificationResult, ClassificationMetadata, AdditionalMetadata
-from faiss_index_manager import FaissIndexManager
-from metadata_manager import MetadataManager
+from .util_classes import SexEnum, ClassificationResult, ClassificationMetadata, AdditionalMetadata
+from .faiss_index_manager import FaissIndexManager
+from .metadata_manager import MetadataManager
 
 # subclassifier models
-from sub_classifiers.race_classifier import RaceClassifier
-from sub_classifiers.famous_classifier import FamousClassifier
+from .sub_classifiers.race_classifier import RaceClassifier
+from .sub_classifiers.famous_classifier import FamousClassifier
 
-from metadata_mongo_manager import MongoMetadataManager
+from .metadata_mongo_manager import MongoMetadataManager
 
 # Load environment variables from .env file
 load_dotenv()
@@ -45,9 +46,9 @@ class FaceClassifier:
             self.face_fid = FaissIndexManager(
                 dim=512,
                 threshold=0.5,
-                faiss_index_path="../faiss_index/faiss_faces.index"
+                faiss_index_path="classification/faiss_index/faiss_faces.index"
             )
-            self.metadata_manager = MetadataManager(metadata="../db/metadata.json")
+            self.metadata_manager = MetadataManager(metadata="classification/db/metadata.json")
         else:
             self.face_fid = FaissIndexManager(
                 dim=512,
@@ -182,44 +183,27 @@ class FaceClassifier:
         """
         return self.face_fid.check_if_present(embedding)
 
-    def analyze_folder(self, folder_path) -> dict[str, ClassificationMetadata]:
-        image_files = [f for f in os.listdir(folder_path)
-                       if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        results = {} # img_path -> idx in metadata
-        for file_name in image_files:
-            img_path = os.path.join(folder_path, file_name)
-            img = cv2.imread(img_path)
-            if img is None:
-                print(f"Cannot read {file_name}")
-                continue
-            print(f"> amalysing {file_name}")
-            faces = self.analyze_image(img)
-            
-            faces_idx = []
-            for face in faces:
-                embedding = face.normed_embedding.astype("float32").reshape(1, -1)
-                
-                search_face = self.check_if_face_present(embedding)
-                if search_face is not None:
-                    # this face was already detected
-                    classification_report = self.metadata_manager.get_by_id(search_face).classification_result
-                    faces_idx.append(search_face)
-                else:
-                    # new face - need to classify it
-                    classification_report = self.detect_(face, img)
-                    
-                    # Add new person
-                    self.face_fid.add_embedding(embedding)
-                    
-                    new_idx = self.metadata_manager.last_index() + 1
-                    self.metadata_manager.add(ClassificationMetadata(
-                        idx=new_idx,
-                        classification_result=classification_report
-                    ))
-                    faces_idx.append(new_idx)
-            results[file_name] = faces_idx
-            
+    def analyze_folder(self, folder_path, session_id: str) -> dict[str, ClassificationMetadata]:
+        # Traverse all subfolders (each representing a person)
+        results = []
+        for root, dirs, files in os.walk(folder_path):
+            for file_name in files:
+                if not file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    continue
+
+                img_path = os.path.join(root, file_name)
+                img = cv2.imread(img_path)
+
+                if img is None:
+                    print(f"Cannot read {img_path}")
+                    continue
+
+                print(f"> Analysing {img_path} ...")
+                result = self.analyze_face_on_frame(img, session_id, None)
+                results.append(result)
+
         return results
+
 
     def save_faiss_index(self):
         self.face_fid.save()

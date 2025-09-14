@@ -9,8 +9,9 @@ import cv2
 from .i_classifier import Classifier
 
 class FamousClassifier(Classifier):
-    _default_model_path = "../models/resnet_famous_faces.pth"
-    _default_classes_path = "../data/Dataset.csv"
+    
+    _default_model_path = "classification/models/resnet_famous_faces.pth"
+    _default_classes_path = "classification/data/Dataset.csv"
 
     def __init__(self, model_path: str = None, device: str = None, threshold: float = 0.975, top_k: int = 3):
         """

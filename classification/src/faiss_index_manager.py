@@ -1,10 +1,10 @@
 import faiss
 import os
-from util_classes import SexEnum, ClassificationResult, ClassificationMetadata
 
+from .util_classes import SexEnum, ClassificationResult, ClassificationMetadata
 
 class FaissIndexManager:
-    _default_save_path = "../faiss_index/faiss_faces.index"
+    _default_save_path = "classification/faiss_index/faiss_faces.index"
     
     def __init__(self, dim: int, threshold: float, faiss_index_path: str = None):
         self.faiss_index_path = faiss_index_path if faiss_index_path else self._default_save_path

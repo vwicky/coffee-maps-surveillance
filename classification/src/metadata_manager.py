@@ -1,10 +1,10 @@
 import json
 from dataclasses import asdict
 from typing import Union
-from util_classes import ClassificationMetadata, ClassificationResult
+from .util_classes import ClassificationMetadata, ClassificationResult
 
 class MetadataManager:
-    _default_save_path = "../db/metadata.json"
+    _default_save_path = "classification/db/metadata.json"
     
     def __init__(self, metadata: Union[str, list[ClassificationMetadata], None] = None):
         """

@@ -1,5 +1,5 @@
 from pymongo import MongoClient
-from util_classes import ClassificationResult, ClassificationMetadata, AdditionalMetadata
+from .util_classes import ClassificationResult, ClassificationMetadata, AdditionalMetadata
 from dataclasses import asdict
 
 class MongoMetadataManager:

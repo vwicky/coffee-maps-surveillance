@@ -39,8 +39,8 @@ def main_2_with_mongo():
     famous_model_path=famous_model_path,
     load_previous_faces=False
   )
-  session_id = "restaurant_001_image_01"
-  image_path = "../data/random_face_images//626d711c22edd.png"
+  session_id = "restaurant_001_image_02"
+  image_path = "../data/random_face_images/1757871046437.jpg"
   
   analyzer.mongo_metadata_manager.create_session(session_id, image_path, "...")
   

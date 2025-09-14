@@ -3,7 +3,7 @@
 detection/detections
 detection/snapshots
 detection/vid
-.vscode
+.vscode/
 
 venv/
 classification/data/
