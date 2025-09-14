@@ -25,17 +25,21 @@ class FaceClassifier:
                  ):
         self.app = FaceAnalysis()
         self.app.prepare(ctx_id=ctx_id, det_size=det_size)
-        
-        self.face_fid = FaissIndexManager(
-            dim=512,
-            threshold=0.5,
-            faiss_index_path="../faiss_index/faiss_faces.index"
-        )
-        
+                
         # loading previous faces
         if load_previous_faces:
+            self.face_fid = FaissIndexManager(
+                dim=512,
+                threshold=0.5,
+                faiss_index_path="../faiss_index/faiss_faces.index"
+            )
             self.metadata_manager = MetadataManager(metadata="../db/metadata.json")
         else:
+            self.face_fid = FaissIndexManager(
+                dim=512,
+                threshold=0.5,
+                faiss_index_path=None
+            )
             self.metadata_manager = MetadataManager(metadata=None)
             
         # loading Race model
@@ -44,7 +48,6 @@ class FaceClassifier:
             self.race_model = RaceClassifier(model_path=race_model_path)
             
     def person_with_id(self, id: int) -> ClassificationResult:
-        
         data = self.metadata_manager.get_by_id(id)
         if data is not None:
             return data.classification_result
@@ -141,58 +144,17 @@ class FaceClassifier:
                     
                     # Add new person
                     self.face_fid.add_embedding(embedding)
+                    
+                    new_idx = self.metadata_manager.last_index() + 1
                     self.metadata_manager.add(ClassificationMetadata(
-                        classification_report, 
-                        self.metadata_manager.last_index() + 1  # new ID
+                        idx=new_idx,
+                        classification_result=classification_report
                     ))
-                    faces_idx.append(self.metadata_manager.last_index() + 1)
+                    faces_idx.append(new_idx)
             results[file_name] = faces_idx
             
         return results
 
-    def analyze_folder_grid(self, folder_path, rows=1, cols=3):
-        """ Use in .ipynb files to display nicely """
-        image_files = [f for f in os.listdir(folder_path)
-                       if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        labeled_images = []
-        titles = []
-        for file_name in image_files:
-            img_path = os.path.join(folder_path, file_name)
-            img = cv2.imread(img_path)
-            if img is None:
-                print(f"Cannot read {file_name}")
-                continue
-            faces = self.analyze_image(img)
-            
-            for face in faces:
-                embedding = face.normed_embedding.astype("float32").reshape(1, -1)
-                
-                search_face = self.check_if_face_present(embedding)
-                if search_face is not None:
-                    # this face was already detected
-                    classification_report = self.metadata_manager.get_by_id(search_face).classification_result
-                    img_labeled = self.draw_face(face, img, classification_report)
-                else:
-                    # new face - need to classify it
-                    classification_report = self.detect_(face, img)
-                    img_labeled = self.draw_face(face, img, classification_report)
-                    
-                    # Add new person
-                    self.face_fid.add_embedding(embedding)
-                    self.metadata_manager.add(ClassificationMetadata(
-                        classification_report, 
-                        len(metadata) - 1  # new ID
-                    ))
-
-                labeled_images.append(img_labeled)
-                titles.append(file_name)
-
-            if len(labeled_images) == rows * cols:
-                self.show_images_grid(labeled_images, titles, rows, cols)
-                labeled_images, titles = [], []
-
-        if labeled_images:
-            self.show_images_grid(labeled_images, titles, rows, cols)
     def save_faiss_index(self):
         self.face_fid.save()
     

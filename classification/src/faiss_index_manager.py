@@ -1,14 +1,20 @@
 import faiss
-
+import os
 from util_classes import SexEnum, ClassificationResult, ClassificationMetadata
 
 
 class FaissIndexManager:
-    def __init__(self, dim: int, threshold: float, faiss_index_path: str = "../faiss_index/faiss_faces.index"):
-        self.index = faiss.IndexFlatIP(dim)
+    _default_save_path = "../faiss_index/faiss_faces.index"
+    
+    def __init__(self, dim: int, threshold: float, faiss_index_path: str = None):
+        self.faiss_index_path = faiss_index_path if faiss_index_path else self._default_save_path
         self.threshold = threshold
-        self.faiss_index_path = faiss_index_path
         
+        if faiss_index_path and os.path.exists(faiss_index_path):
+            self.load()
+        else:
+            self.index = faiss.IndexFlatIP(dim)
+
     def add_embedding(self, embedding):
         self.index.add(embedding)
         
@@ -29,6 +35,9 @@ class FaissIndexManager:
             return None
         
     def save(self):
-        return faiss.write_index(self.index, self.faiss_index_path)
+        faiss.write_index(self.index, self.faiss_index_path)
+        print(f"Index saved to {self.faiss_index_path}")
+        
     def load(self):
-        return faiss.read_index(self.faiss_index_path)
+        self.index = faiss.read_index(self.faiss_index_path)
+        return self.index

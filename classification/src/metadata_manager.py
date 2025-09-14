@@ -1,7 +1,7 @@
 import json
 from dataclasses import asdict
 from typing import Union
-from util_classes import ClassificationMetadata
+from util_classes import ClassificationMetadata, ClassificationResult
 
 class MetadataManager:
     _default_save_path = "../db/metadata.json"
@@ -37,7 +37,8 @@ class MetadataManager:
 
         self.metadata = []
         for face_id, data in raw.items():
-            self.metadata.append(ClassificationMetadata(face_id=face_id, **data))
+            data = ClassificationResult(**data)
+            self.metadata.append(ClassificationMetadata(idx=face_id, classification_result=data))
 
     def save(self, path: str = None):
         """Save metadata to a JSON file (face_id → attributes)."""
