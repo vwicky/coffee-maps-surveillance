@@ -49,38 +49,23 @@ class FamousClassifier(Classifier):
         ])
 
     def predict(self, img):
-        """
-        img: PIL Image or NumPy array (BGR from OpenCV)
-        Returns: tuple of (label, probability) or ("not famous", max_prob)
-        """
-        # convert numpy/OpenCV BGR -> PIL RGB
+        # convert NumPy/OpenCV BGR -> PIL RGB
         if isinstance(img, np.ndarray):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(img)
 
-        # preprocess
         x = self.preprocess(img).unsqueeze(0).to(self.device)
 
-        # forward pass
         with torch.no_grad():
             logits = self.model(x)
             probs = F.softmax(logits, dim=1)
 
-        # get top-k
-        top_probs, top_idxs = probs.topk(self.top_k, dim=1)
-        top_probs = top_probs.squeeze().tolist()
-        top_idxs = top_idxs.squeeze().tolist()
-        if isinstance(top_probs, float):  # if only 1 class, make it list
-            top_probs = [top_probs]
-            top_idxs = [top_idxs]
+        top_prob, top_idx = probs.max(dim=1)
+        top_prob = top_prob.item()
+        top_idx = top_idx.item()
 
-        labels = [self.idx2label[i] for i in top_idxs]
-
-        # debug print
-        # print("Top-k predictions:", list(zip(labels, top_probs)))
-
-        # decide if famous
-        if max(top_probs) < self.threshold:
-            return "not famous", max(top_probs)
+        if top_prob < self.threshold:
+            return "not famous", top_prob
         else:
-            return labels[0], top_probs[0]
+            return self.idx2label[top_idx], top_prob
+

@@ -85,7 +85,7 @@ class RaceClassifier(Classifier):
         max_prob, race_idx = torch.max(probs_avg, dim=-1)
 
         if max_prob.item() < threshold:
-            return "unknown", 0.0
+            return "unknown", max_prob.item()
 
         return self.race_labels[race_idx.item()], max_prob.item()
   

@@ -93,7 +93,7 @@ class FaceClassifier:
     
     def detect_race(self, face, img) -> str:
         race, percentage = self.predict_race(face, img)
-        return f"{race}, {percentage}%"
+        return race, percentage
     
     def detect_(self, face, img) -> ClassificationResult:
         gender = self.detect_gender(face)
