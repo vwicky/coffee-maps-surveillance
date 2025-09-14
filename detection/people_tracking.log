@@ -1061,3 +1061,78 @@
 2025-09-14 19:57:49 [INFO] Average stay duration: 12.3s
 2025-09-14 19:57:49 [INFO] Max stay duration: 28.5s
 2025-09-14 19:57:49 [INFO] Min stay duration: 0.4s
+2025-09-14 20:07:20 [INFO] Finished processing video
+2025-09-14 20:07:20 [INFO] No visitors detected
+2025-09-14 20:07:24 [INFO] Finished processing video
+2025-09-14 20:07:24 [INFO] No visitors detected
+2025-09-14 20:07:34 [INFO] Finished processing video
+2025-09-14 20:07:34 [INFO] No visitors detected
+2025-09-14 20:07:46 [INFO] Person 1 entered at 20:07:46
+2025-09-14 20:07:47 [INFO] Person 2 entered at 20:07:47
+2025-09-14 20:07:47 [INFO] Person 3 entered at 20:07:47
+2025-09-14 20:07:47 [INFO] Person 4 entered at 20:07:47
+2025-09-14 20:07:47 [INFO] Person 5 entered at 20:07:47
+2025-09-14 20:07:47 [INFO] Person 6 entered at 20:07:47
+2025-09-14 20:07:47 [INFO] Person 7 entered at 20:07:47
+2025-09-14 20:07:47 [INFO] Person 8 entered at 20:07:47
+2025-09-14 20:07:50 [INFO] Person 11 entered at 20:07:50
+2025-09-14 20:07:51 [INFO] Person 11 exited at 20:07:51 (duration 0.4s)
+2025-09-14 20:07:54 [INFO] Person 1 still in frame at end (duration 7.2s)
+2025-09-14 20:07:54 [INFO] Person 2 still in frame at end (duration 7.1s)
+2025-09-14 20:07:54 [INFO] Person 3 still in frame at end (duration 7.1s)
+2025-09-14 20:07:54 [INFO] Person 4 still in frame at end (duration 7.1s)
+2025-09-14 20:07:54 [INFO] Person 5 still in frame at end (duration 7.0s)
+2025-09-14 20:07:54 [INFO] Person 6 still in frame at end (duration 7.0s)
+2025-09-14 20:07:54 [INFO] Person 7 still in frame at end (duration 7.0s)
+2025-09-14 20:07:54 [INFO] Person 8 still in frame at end (duration 7.0s)
+2025-09-14 20:07:54 [INFO] Finished processing video
+2025-09-14 20:07:54 [INFO] Total visitors detected: 9
+2025-09-14 20:07:54 [INFO] Average stay duration: 6.3s
+2025-09-14 20:07:54 [INFO] Max stay duration: 7.2s
+2025-09-14 20:07:54 [INFO] Min stay duration: 0.4s
+2025-09-14 20:10:15 [INFO] Person 1 entered at 20:10:15
+2025-09-14 20:10:15 [INFO] Person 2 entered at 20:10:15
+2025-09-14 20:10:15 [INFO] Person 3 entered at 20:10:15
+2025-09-14 20:10:15 [INFO] Person 4 entered at 20:10:15
+2025-09-14 20:10:15 [INFO] Person 5 entered at 20:10:15
+2025-09-14 20:10:15 [INFO] Person 6 entered at 20:10:15
+2025-09-14 20:10:15 [INFO] Person 7 entered at 20:10:15
+2025-09-14 20:10:15 [INFO] Person 8 entered at 20:10:15
+2025-09-14 20:10:18 [INFO] Person 11 entered at 20:10:18
+2025-09-14 20:10:19 [INFO] Person 11 exited at 20:10:19 (duration 0.5s)
+2025-09-14 20:10:20 [INFO] Person 1 still in frame at end (duration 5.3s)
+2025-09-14 20:10:20 [INFO] Person 2 still in frame at end (duration 5.3s)
+2025-09-14 20:10:20 [INFO] Person 3 still in frame at end (duration 5.3s)
+2025-09-14 20:10:20 [INFO] Person 4 still in frame at end (duration 5.3s)
+2025-09-14 20:10:20 [INFO] Person 5 still in frame at end (duration 5.3s)
+2025-09-14 20:10:20 [INFO] Person 6 still in frame at end (duration 5.3s)
+2025-09-14 20:10:20 [INFO] Person 7 still in frame at end (duration 5.3s)
+2025-09-14 20:10:20 [INFO] Person 8 still in frame at end (duration 5.2s)
+2025-09-14 20:10:20 [INFO] Finished processing video
+2025-09-14 20:10:20 [INFO] Total visitors detected: 9
+2025-09-14 20:10:20 [INFO] Average stay duration: 4.8s
+2025-09-14 20:10:20 [INFO] Max stay duration: 5.3s
+2025-09-14 20:10:20 [INFO] Min stay duration: 0.5s
+2025-09-14 20:13:06 [INFO] Person 1 entered at 20:13:06
+2025-09-14 20:13:06 [INFO] Person 2 entered at 20:13:06
+2025-09-14 20:13:06 [INFO] Person 3 entered at 20:13:06
+2025-09-14 20:13:06 [INFO] Person 4 entered at 20:13:06
+2025-09-14 20:13:06 [INFO] Person 5 entered at 20:13:06
+2025-09-14 20:13:06 [INFO] Person 6 entered at 20:13:06
+2025-09-14 20:13:06 [INFO] Person 7 entered at 20:13:06
+2025-09-14 20:13:06 [INFO] Person 8 entered at 20:13:06
+2025-09-14 20:13:09 [INFO] Person 11 entered at 20:13:09
+2025-09-14 20:13:12 [INFO] Person 1 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 2 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 3 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 4 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 5 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 6 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 7 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 8 still in frame at end (duration 5.9s)
+2025-09-14 20:13:12 [INFO] Person 11 still in frame at end (duration 2.7s)
+2025-09-14 20:13:12 [INFO] Finished processing video
+2025-09-14 20:13:12 [INFO] Total visitors detected: 9
+2025-09-14 20:13:12 [INFO] Average stay duration: 5.6s
+2025-09-14 20:13:12 [INFO] Max stay duration: 5.9s
+2025-09-14 20:13:12 [INFO] Min stay duration: 2.7s
