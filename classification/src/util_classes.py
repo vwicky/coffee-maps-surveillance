@@ -6,9 +6,9 @@ class SexEnum:
     
 @dataclass
 class ClassificationResult:
-    age: int
-    sex: str
-    race: str
+    age: int = 0
+    sex: str = ""
+    race: str = ""
     
 @dataclass
 class ClassificationMetadata:

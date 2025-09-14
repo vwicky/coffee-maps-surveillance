@@ -1,23 +1,92 @@
-
-from util_classes import SexEnum, ClassificationResult, ClassificationMetadata
+import json
+from dataclasses import asdict
+from typing import Union
+from util_classes import ClassificationMetadata
 
 class MetadataManager:
-  def __init__(self, metadata: list[ClassificationMetadata]):
-    self.metadata = metadata if metadata else []
+    _default_save_path = "../db/metadata.json"
     
-  def last_index(self) -> int:
-    return len(self.metadata) - 1
-    
-  def get_by_id(self, id: int) -> ClassificationMetadata:
-    return self.metadata[id]
-  
-  def add(self, classification_metadata: ClassificationMetadata) -> int:
-    """
-    Args:
-        classification_metadata (ClassificationMetadata): what we add
-    Returns:
-        int: new element's id
-    """
-    self.metadata.append(classification_metadata)
-    return self.last_index()
-     
+    def __init__(self, metadata: Union[str, list[ClassificationMetadata], None] = None):
+        """
+        metadata can be:
+          - str : path to JSON file
+          - list : list of ClassificationMetadata
+          - None : start with empty list
+        """
+        if isinstance(metadata, str):
+            self.metadata: list[ClassificationMetadata] = []
+            self.load(metadata)
+        elif isinstance(metadata, list):
+            self.metadata = metadata
+        else:
+            self.metadata = []
+
+    # ------------------- Persistence -------------------
+    def load(self, path: str = None):
+        """Load metadata from a JSON file into ClassificationMetadata objects."""
+        
+        path = path if path else self._default_save_path
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+
+        if not content:  # empty file
+            self.metadata = []
+            return
+
+        raw = json.loads(content)
+
+        self.metadata = []
+        for face_id, data in raw.items():
+            self.metadata.append(ClassificationMetadata(face_id=face_id, **data))
+
+    def save(self, path: str = None):
+        """Save metadata to a JSON file (face_id → attributes)."""
+        path = path if path else self._default_save_path
+        
+        export = {m.idx: asdict(m.classification_result) for m in self.metadata}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(export, f, indent=2, ensure_ascii=False)
+
+    # ------------------- Access -------------------
+    def last_index(self) -> int:
+        return max(0, len(self.metadata) - 1)
+
+    def get_length(self) -> int:
+        return len(self.metadata)
+
+    def get_by_id(self, idx: int) -> ClassificationMetadata:
+        try:
+            return self.metadata[idx]
+        except IndexError:
+            print(f"> Index {idx} was out of range, metadata has {self.get_length()} elements")
+            return None
+
+    def get_by_face_id(self, face_id: str) -> ClassificationMetadata | None:
+        for m in self.metadata:
+            if m.face_id == face_id:
+                return m
+        return None
+
+    # ------------------- Modify -------------------
+    def add(self, classification_metadata: ClassificationMetadata) -> int:
+        """Append new metadata and return its index."""
+        self.metadata.append(classification_metadata)
+        return self.last_index()
+
+    def remove_by_face_id(self, face_id: str) -> bool:
+        """Remove metadata by face_id, return True if removed."""
+        for i, m in enumerate(self.metadata):
+            if m.face_id == face_id:
+                del self.metadata[i]
+                return True
+        return False
+
+    # ------------------- Pythonic -------------------
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx: int) -> ClassificationMetadata:
+        return self.metadata[idx]
+
+    def __iter__(self):
+        return iter(self.metadata)

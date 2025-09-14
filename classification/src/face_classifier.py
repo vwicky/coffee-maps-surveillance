@@ -14,6 +14,7 @@ import numpy as np
 from util_classes import SexEnum, ClassificationResult, ClassificationMetadata
 from faiss_index_manager import FaissIndexManager
 from metadata_manager import MetadataManager
+from sub_classifiers.race_classifier import RaceClassifier
 
 class FaceClassifier:
     def __init__(self, 
@@ -28,37 +29,26 @@ class FaceClassifier:
         self.face_fid = FaissIndexManager(
             dim=512,
             threshold=0.5,
-            faiss_index_path="faiss_index/faiss_faces.index"
+            faiss_index_path="../faiss_index/faiss_faces.index"
         )
         
+        # loading previous faces
         if load_previous_faces:
-            metadata = self.face_fid.load()
-            self.metadata_manager = MetadataManager(metadata=metadata)
+            self.metadata_manager = MetadataManager(metadata="../db/metadata.json")
         else:
             self.metadata_manager = MetadataManager(metadata=None)
-
-        # Load race model if provided
-        self.race_model = None
-        self.race_extractor = None
-        
-        # Define once in __init__
-        self.race_transform = transforms.Compose([
-            transforms.Resize((224, 224)),  # or model expected size
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225])
-        ])
-
+            
+        # loading Race model
+        self.race_model_path = race_model_path
         if race_model_path:
-            self.race_model = AutoModelForImageClassification.from_pretrained(
-                race_model_path, trust_remote_code=True
-            )
-            self.race_extractor = AutoFeatureExtractor.from_pretrained(
-                race_model_path, trust_remote_code=True
-            )
-            self.race_model.eval()
-            # Map numeric labels to names
-            self.race_labels = self.race_model.config.id2label
+            self.race_model = RaceClassifier(model_path=race_model_path)
+            
+    def person_with_id(self, id: int) -> ClassificationResult:
+        
+        data = self.metadata_manager.get_by_id(id)
+        if data is not None:
+            return data.classification_result
+        return ClassificationResult()
 
     def analyze_image(self, img):
         faces = self.app.get(img)
@@ -73,67 +63,21 @@ class FaceClassifier:
             Confidence threshold → ignore low-confidence predictions.   
         Returns: (race_label, confidence)
         """
-        if self.race_model is None:
+        if self.race_model_path is None:
             return "unknown", 0.0
 
-        # Get bounding box and landmarks
-        x1, y1, x2, y2 = map(int, face.bbox)
-        h, w, _ = img.shape
-        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-
-        # Use landmarks for tighter crop if available
-        if hasattr(face, 'kps') and face.kps is not None:
-            # landmarks: 5 or 68 points (x, y)
-            kps = np.array(face.kps)
-            x_min = max(0, int(kps[:,0].min()))
-            y_min = max(0, int(kps[:,1].min()))
-            x_max = min(w, int(kps[:,0].max()))
-            y_max = min(h, int(kps[:,1].max()))
-            x1, y1, x2, y2 = x_min, y_min, x_max, y_max
-
-        # Crop the face
-        face_crop = img[y1:y2, x1:x2]
-        if face_crop.size == 0:
-            return "unknown", 0.0
-
-        # Prepare crops for ensemble
-        crops = [face_crop]
-        if ensemble:
-            # Slight shifts
-            dh, dw = int(0.05*(y2-y1)), int(0.05*(x2-x1))
-            crops.append(img[max(0,y1-dh):min(h,y2+dh), max(0,x1-dw):min(w,x2+dw)])
-            crops.append(img[max(0,y1+dh):min(h,y2-dh), max(0,x1+dw):min(w,x2-dw)])
-
-        probs_list = []
-        for crop in crops:
-            # Convert BGR -> RGB PIL
-            img_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-            # Resize to model expected size
-            img_pil = img_pil.resize((224,224))
-            # Transform
-            img_tensor = self.race_transform(img_pil).unsqueeze(0)
-
-            with torch.no_grad():
-                outputs = self.race_model(img_tensor)
-                probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                probs_list.append(probs)
-
-        # Average ensemble probabilities
-        probs_avg = torch.mean(torch.stack(probs_list), dim=0)
-        max_prob, race_idx = torch.max(probs_avg, dim=-1)
-
-        if max_prob.item() < threshold:
-            return "unknown", 0.0
-
-        return self.race_labels[race_idx.item()], max_prob.item()
+        return self.race_model.predict_race(face, img, ensemble, threshold)
 
     def detect_gender(self, face) -> str:
         return SexEnum.MALE if face.gender == 1 else SexEnum.FEMALE
+    
     def detect_age(self, face) -> int:
         return int(face.age)
+    
     def detect_race(self, face, img) -> str:
         race, percentage = self.predict_race(face, img)
         return f"{race}, {percentage}%"
+    
     def detect_(self, face, img) -> ClassificationResult:
         gender = self.detect_gender(face)
         age = self.detect_age(face)
@@ -169,7 +113,7 @@ class FaceClassifier:
         """
         return self.face_fid.check_if_present(embedding)
 
-    def analyze_folder(self, folder_path):
+    def analyze_folder(self, folder_path) -> dict[str, ClassificationMetadata]:
         image_files = [f for f in os.listdir(folder_path)
                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         results = {} # img_path -> idx in metadata
@@ -190,12 +134,10 @@ class FaceClassifier:
                 if search_face is not None:
                     # this face was already detected
                     classification_report = self.metadata_manager.get_by_id(search_face).classification_result
-                    img_labeled = self.draw_face(face, img, classification_report)
                     faces_idx.append(search_face)
                 else:
                     # new face - need to classify it
                     classification_report = self.detect_(face, img)
-                    img_labeled = self.draw_face(face, img, classification_report)
                     
                     # Add new person
                     self.face_fid.add_embedding(embedding)
@@ -253,4 +195,7 @@ class FaceClassifier:
             self.show_images_grid(labeled_images, titles, rows, cols)
     def save_faiss_index(self):
         self.face_fid.save()
+    
+    def save_metadata(self):
+        self.metadata_manager.save()
     
