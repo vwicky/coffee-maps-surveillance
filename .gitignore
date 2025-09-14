@@ -1,4 +1,5 @@
 .env
 detection/detections
-detection/saved_people
+detection/snapshots
 detection/vid
+.vscode
