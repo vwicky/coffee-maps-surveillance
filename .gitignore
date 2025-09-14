@@ -1,5 +1,11 @@
 .env
+
 detection/detections
 detection/snapshots
 detection/vid
 .vscode
+
+venv/
+classification/data/
+classification/models/
+classification/faiss_index
