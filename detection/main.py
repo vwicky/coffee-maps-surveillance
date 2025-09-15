@@ -14,7 +14,7 @@ import pyautogui
 # --- Настройки ---
 LOGGER.setLevel(40)
 logging.basicConfig(
-    filename="people_tracking.log",
+    filename="logs/people_tracking.log",
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
@@ -182,7 +182,7 @@ class StatisticsLogger:
             logging.info("No visitors detected")
 
         # Save CSV
-        with open("people_times.csv", "w", newline="", encoding="utf-8") as f:
+        with open("logs/people_times.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["ID", "Enter", "Exit", "Duration_sec"])
             for tid, t in times.items():

@@ -4,6 +4,7 @@ detection/detections
 detection/snapshots
 detection/vid
 .vscode/
+detection/__pycache__/
 
 venv/
 classification/data/

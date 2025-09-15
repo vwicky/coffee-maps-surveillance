@@ -35,4 +35,5 @@ def main_offline() -> None:
         print(result)
 
 if __name__ == "__main__":
-    main_offline()
+    print("> all launched")
+    # main_offline()
