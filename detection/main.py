@@ -58,7 +58,7 @@ class VideoProcessor:
 
 class PersonTracker:
     def __init__(self, model_path="yolov8n.pt", class_names=["person"], min_conf=0.4,
-                 min_box_size=10, alpha=0.3, process_every_n=2):
+                 min_box_size=10, alpha=0.3, process_every_n=2, snaphots_path = None):
         self.model = YOLO(model_path)
         self.class_names = class_names
         self.min_conf = min_conf
@@ -72,6 +72,7 @@ class PersonTracker:
         self.track_history = defaultdict(list)
         self.times = {}
         self.saved_photos = defaultdict(list)
+        self.snaphots_path = snaphots_path
 
     def process_frame(self, frame, orig_frame):
         active_ids = set()
@@ -134,7 +135,7 @@ class PersonTracker:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 3)
             
             # --- Snapshot ---
-            SnapshotManager.save_snapshot(orig_frame, track_id, (x1, y1, x2, y2), self.saved_photos)
+            SnapshotManager.save_snapshot(orig_frame, track_id, (x1, y1, x2, y2), self.saved_photos, self.snaphots_path)
 
         return frame
 
@@ -143,9 +144,11 @@ class SnapshotManager:
     snapshots_dir = "snapshots"
 
     @staticmethod
-    def save_snapshot(orig_frame, track_id, bbox, saved_photos):
+    def save_snapshot(orig_frame, track_id, bbox, saved_photos, snaphots_path):
+        snaphots_path = snaphots_path if snaphots_path else SnapshotManager.snapshots_dir
+        
         x1, y1, x2, y2 = bbox
-        person_dir = os.path.join(SnapshotManager.snapshots_dir, str(track_id))
+        person_dir = os.path.join(snaphots_path, str(track_id))
         os.makedirs(person_dir, exist_ok=True)
 
         if len(saved_photos[track_id]) < 5:
@@ -191,10 +194,10 @@ class StatisticsLogger:
                 ])
 
 
-class MainApp:
-    def __init__(self, video_path, output_path):
+class DetectionManager:
+    def __init__(self, video_path, output_path, snaphots_path):
         self.processor = VideoProcessor(video_path, output_path)
-        self.tracker = PersonTracker()
+        self.tracker = PersonTracker(snaphots_path=snaphots_path)
 
     def run(self):
         while True:
@@ -212,5 +215,5 @@ class MainApp:
 
 
 if __name__ == "__main__":
-    app = MainApp("coffee_shop.mp4", "processed_video.mp4")
+    app = DetectionManager("coffee_shop.mp4", "processed_video.mp4", None)
     app.run()
