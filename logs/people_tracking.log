@@ -138,5 +138,87 @@
 2025-09-15 22:03:57 [INFO] Min stay duration: 2.5s
 2025-09-15 23:11:12 [INFO] Loading faiss with AVX2 support.
 2025-09-15 23:11:12 [INFO] Successfully loaded faiss with AVX2 support.
+<<<<<<< HEAD:logs/people_tracking.log
 2025-09-18 14:18:47 [INFO] Loading faiss with AVX2 support.
 2025-09-18 14:18:47 [INFO] Successfully loaded faiss with AVX2 support.
+=======
+2025-09-18 13:37:51 [INFO] No visitors detected
+2025-09-18 13:38:37 [INFO] No visitors detected
+2025-09-18 13:39:48 [INFO] No visitors detected
+2025-09-18 13:40:46 [INFO] No visitors detected
+2025-09-18 13:41:07 [INFO] No visitors detected
+2025-09-18 13:43:44 [INFO] No visitors detected
+2025-09-18 13:50:53 [INFO] Person 1 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 2 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 3 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 4 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 5 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 6 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 7 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 8 entered at 13:50:53
+2025-09-18 13:50:53 [INFO] Person 10 entered at 13:50:53
+2025-09-18 13:51:33 [INFO] Person 1 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 2 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 3 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 4 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 5 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 6 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 7 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 8 entered at 13:51:33
+2025-09-18 13:51:33 [INFO] Person 10 entered at 13:51:33
+2025-09-18 13:51:43 [INFO] Person 15 entered at 13:51:43
+2025-09-18 13:51:48 [INFO] Person 16 entered at 13:51:48
+2025-09-18 13:51:48 [INFO] Person 18 entered at 13:51:48
+2025-09-18 13:51:48 [INFO] Person 19 entered at 13:51:48
+2025-09-18 13:51:48 [INFO] Person 21 entered at 13:51:48
+2025-09-18 13:51:48 [INFO] Person 22 entered at 13:51:48
+2025-09-18 13:51:52 [INFO] Person 39 entered at 13:51:52
+2025-09-18 13:51:52 [INFO] Person 40 entered at 13:51:52
+2025-09-18 13:51:52 [INFO] Person 41 entered at 13:51:52
+2025-09-18 13:51:54 [INFO] Person 44 entered at 13:51:54
+2025-09-18 13:51:56 [INFO] Person 52 entered at 13:51:56
+2025-09-18 13:51:56 [INFO] Person 53 entered at 13:51:56
+2025-09-18 13:51:56 [INFO] Person 54 entered at 13:51:56
+2025-09-18 13:51:56 [INFO] Person 55 entered at 13:51:56
+2025-09-18 13:51:56 [INFO] Person 56 entered at 13:51:56
+2025-09-18 13:51:59 [INFO] Person 57 entered at 13:51:59
+2025-09-18 13:52:02 [INFO] Person 58 entered at 13:52:02
+2025-09-18 13:52:03 [INFO] Person 60 entered at 13:52:03
+2025-09-18 13:52:10 [INFO] Person 62 entered at 13:52:10
+2025-09-18 13:52:10 [INFO] Person 63 entered at 13:52:10
+2025-09-18 13:52:12 [INFO] Person 1 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 2 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 3 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 4 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 5 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 6 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 7 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 8 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 10 still in frame at end (duration 38.7s)
+2025-09-18 13:52:12 [INFO] Person 15 still in frame at end (duration 29.0s)
+2025-09-18 13:52:12 [INFO] Person 16 still in frame at end (duration 24.2s)
+2025-09-18 13:52:12 [INFO] Person 18 still in frame at end (duration 24.0s)
+2025-09-18 13:52:12 [INFO] Person 19 still in frame at end (duration 24.0s)
+2025-09-18 13:52:12 [INFO] Person 21 still in frame at end (duration 23.7s)
+2025-09-18 13:52:12 [INFO] Person 22 still in frame at end (duration 23.7s)
+2025-09-18 13:52:12 [INFO] Person 39 still in frame at end (duration 20.0s)
+2025-09-18 13:52:12 [INFO] Person 40 still in frame at end (duration 20.0s)
+2025-09-18 13:52:12 [INFO] Person 41 still in frame at end (duration 20.0s)
+2025-09-18 13:52:12 [INFO] Person 44 still in frame at end (duration 18.4s)
+2025-09-18 13:52:12 [INFO] Person 52 still in frame at end (duration 15.7s)
+2025-09-18 13:52:12 [INFO] Person 53 still in frame at end (duration 15.7s)
+2025-09-18 13:52:12 [INFO] Person 54 still in frame at end (duration 15.7s)
+2025-09-18 13:52:12 [INFO] Person 55 still in frame at end (duration 15.7s)
+2025-09-18 13:52:12 [INFO] Person 56 still in frame at end (duration 15.7s)
+2025-09-18 13:52:12 [INFO] Person 57 still in frame at end (duration 13.3s)
+2025-09-18 13:52:12 [INFO] Person 58 still in frame at end (duration 10.3s)
+2025-09-18 13:52:12 [INFO] Person 60 still in frame at end (duration 9.3s)
+2025-09-18 13:52:12 [INFO] Person 62 still in frame at end (duration 2.5s)
+2025-09-18 13:52:12 [INFO] Person 63 still in frame at end (duration 1.6s)
+2025-09-18 13:52:12 [INFO] Total visitors detected: 29
+2025-09-18 13:52:12 [INFO] Average stay duration: 23.8s
+2025-09-18 13:52:12 [INFO] Max stay duration: 38.7s
+2025-09-18 13:52:12 [INFO] Min stay duration: 1.6s
+>>>>>>> 0cc075d0bc273d12d1468ce1d93367ad1ae1d645:detection/logs/people_tracking.log
+2025-09-18 14:22:47 [INFO] Loading faiss with AVX2 support.
+2025-09-18 14:22:47 [INFO] Successfully loaded faiss with AVX2 support.

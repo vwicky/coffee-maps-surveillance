@@ -1,5 +1,5 @@
 
-from face_classifier import FaceClassifier
+from .face_classifier import FaceClassifier
 import cv2
 
 def main_1() -> None:

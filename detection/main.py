@@ -11,7 +11,7 @@ import logging
 import csv
 import pyautogui
 
-# --- Настройки ---
+# Settings
 LOGGER.setLevel(40)
 logging.basicConfig(
     filename="logs/people_tracking.log",
@@ -112,14 +112,14 @@ class PersonTracker:
                     random.randint(0, 255)
                 )
 
-            # --- Timing ---
+            # Timing
             if track_id not in self.times:
                 self.times[track_id] = {"enter": now, "last": now, "exit": None, "duration": None}
                 logging.info(f"Person {track_id} entered at {now.strftime('%H:%M:%S')}")
             else:
                 self.times[track_id]["last"] = now
 
-            # --- Smooth positions ---
+            # Smooth positions
             if track_id in self.last_positions:
                 px1, py1, px2, py2 = self.last_positions[track_id]
                 x1 = int(px1 + self.alpha * (x1 - px1))
@@ -134,7 +134,7 @@ class PersonTracker:
             cv2.putText(frame, f"ID {track_id} {delta:.1f}s", (x1, y1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 3)
             
-            # --- Snapshot ---
+            #Snapshot
             SnapshotManager.save_snapshot(orig_frame, track_id, (x1, y1, x2, y2), self.saved_photos, self.snaphots_path)
 
         return frame
