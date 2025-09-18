@@ -63,7 +63,8 @@ python main.py --video-path "your_video_path.mp4"
 
 Screenshots of processed frames:
 
-https://github.com/user-attachments/assets/96b0871c-0b8b-4dea-9ec2-764d2c80d603
+![processed_video-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/b51becb8-d4e7-4e75-815a-c6f5510b820d)
+
 
 <img width="961" height="579" alt="image" src="https://github.com/user-attachments/assets/53d0ae4c-405a-492b-82c8-3e4f3fed62c3" />
 <img width="860" height="577" alt="image_2025-09-18_14-36-01" src="https://github.com/user-attachments/assets/18b864c9-2ecd-428f-9b60-a36bbfa86d89" />
