@@ -14,16 +14,6 @@ The system takes a video as input and produces multiple outputs that help monito
 - Stores snapshots of visitors for further analysis.
 - Populates a MongoDB database with classifications, including gender, age, and race.
 
-## System Requirements
-- Python 3.11
-- Libraries:
-    ultralytics==8.3.0
-    opencv-python==4.10.0.84
-    pyautogui
-    pymongo
-    numpy
-    Other dependencies listed in requirements.txt
-
 ## 🔧 Installation
 
 ### 1. Clone Repository
@@ -47,7 +37,7 @@ make
 venv\Scripts\activate      # Windows PowerShell / CMD
 
 # run script
-python main.py
+python main.py --video-path "your_video_path.mp4"
 ```
 
 ### Option B: Manual Installation
@@ -63,10 +53,15 @@ venv\Scripts\activate      # Windows PowerShell / CMD
 pip install -r requirements.txt
 
 # 4. Run a file
-python main.py
+python main.py --video-path "your_video_path.mp4"
 ```
 
-## Notes
-- Ensure MongoDB is running and accessible for demographic classification storage.
-- The system currently supports pre-recorded video files; live camera support can be added.
-- Press "q" to stop video preview during processing (if GUI is enabled).
+## Example 
+- Input video: [coffee_shop.mp4](https://drive.google.com/file/d/1QMdTmda82vBEIEZ6PZm2rCs_nnOScm8f/view?usp=drive_link)
+- Processed video output: [processed_video.mp4](https://drive.google.com/file/d/1aLn08MSviUF2ECWHG6OjoDBOTfT8Egmc/view?usp=drive_link)
+- MongoDB database view: screenshots
+
+Screenshots of processed frames:
+<img width="961" height="579" alt="image" src="https://github.com/user-attachments/assets/53d0ae4c-405a-492b-82c8-3e4f3fed62c3" />
+<img width="860" height="577" alt="image_2025-09-18_14-36-01" src="https://github.com/user-attachments/assets/18b864c9-2ecd-428f-9b60-a36bbfa86d89" />
+
