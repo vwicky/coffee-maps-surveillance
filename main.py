@@ -1,4 +1,6 @@
 import argparse
+import os
+from datetime import datetime
 from detection.main import DetectionManager
 from classification.src.face_classifier import FaceClassifier
 
@@ -25,11 +27,16 @@ def main_offline(video_path: str) -> None:
         famous_model_path=famous_model_path,
         load_previous_faces=False
     )
-    
-    analyzer.mongo_metadata_manager.create_session("random_session_1", snapshots_path, "...")
 
-    # Analyze the image (frame_number can just be 0 for single image)
-    results = analyzer.analyze_folder(snapshots_path, "random_session_1")
+    # Generate session name: videoName_YYYYMMDD_HHMMSS
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_name = f"{video_name}_{timestamp}"
+
+    analyzer.mongo_metadata_manager.create_session(session_name, snapshots_path, "...")
+
+    # Analyze the images
+    results = analyzer.analyze_folder(snapshots_path, session_name)
     for result in results:
         print(result)
 
