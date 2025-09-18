@@ -222,3 +222,22 @@
 >>>>>>> 0cc075d0bc273d12d1468ce1d93367ad1ae1d645:detection/logs/people_tracking.log
 2025-09-18 14:22:47 [INFO] Loading faiss with AVX2 support.
 2025-09-18 14:22:47 [INFO] Successfully loaded faiss with AVX2 support.
+2025-09-18 14:32:38 [INFO] Loading faiss with AVX2 support.
+2025-09-18 14:32:38 [INFO] Successfully loaded faiss with AVX2 support.
+2025-09-18 14:32:48 [INFO] Person 1 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 2 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 3 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 4 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 5 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 6 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 7 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 8 entered at 14:32:48
+2025-09-18 14:32:48 [INFO] Person 10 entered at 14:32:48
+2025-09-18 14:32:56 [INFO] Person 14 entered at 14:32:56
+2025-09-18 14:32:59 [INFO] Person 15 entered at 14:32:59
+2025-09-18 14:32:59 [INFO] Person 16 entered at 14:32:59
+2025-09-18 14:33:03 [INFO] Person 19 entered at 14:33:03
+2025-09-18 14:33:09 [INFO] Person 20 entered at 14:33:09
+2025-09-18 14:33:10 [INFO] Person 22 entered at 14:33:10
+2025-09-18 14:33:15 [INFO] Person 24 entered at 14:33:15
+2025-09-18 14:33:16 [INFO] Person 25 entered at 14:33:16
