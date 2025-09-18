@@ -134,13 +134,8 @@ class PersonTracker:
             cv2.putText(frame, f"ID {track_id} {delta:.1f}s", (x1, y1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 3)
             
-<<<<<<< HEAD
-            # Snapshot
-            SnapshotManager.save_snapshot(orig_frame, track_id, (x1, y1, x2, y2), self.saved_photos)
-=======
-            # --- Snapshot ---
+            #Snapshot
             SnapshotManager.save_snapshot(orig_frame, track_id, (x1, y1, x2, y2), self.saved_photos, self.snaphots_path)
->>>>>>> 27a929fb9c11e2e39932205023698c82506c43de
 
         return frame
 
