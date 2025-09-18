@@ -57,11 +57,14 @@ python main.py --video-path "your_video_path.mp4"
 ```
 
 ## Example 
-- Input video: [coffee_shop.mp4](https://drive.google.com/file/d/1QMdTmda82vBEIEZ6PZm2rCs_nnOScm8f/view?usp=drive_link)
-- Processed video output: [processed_video.mp4](https://drive.google.com/file/d/1aLn08MSviUF2ECWHG6OjoDBOTfT8Egmc/view?usp=drive_link)
+- Full input video: [coffee_shop.mp4](https://drive.google.com/file/d/1QMdTmda82vBEIEZ6PZm2rCs_nnOScm8f/view?usp=drive_link)
+- Full processed video output: [processed_video.mp4](https://drive.google.com/file/d/1aLn08MSviUF2ECWHG6OjoDBOTfT8Egmc/view?usp=drive_link)
 - MongoDB database view: screenshots
 
 Screenshots of processed frames:
+
+https://github.com/user-attachments/assets/96b0871c-0b8b-4dea-9ec2-764d2c80d603
+
 <img width="961" height="579" alt="image" src="https://github.com/user-attachments/assets/53d0ae4c-405a-492b-82c8-3e4f3fed62c3" />
 <img width="860" height="577" alt="image_2025-09-18_14-36-01" src="https://github.com/user-attachments/assets/18b864c9-2ecd-428f-9b60-a36bbfa86d89" />
 
