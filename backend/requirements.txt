@@ -1,0 +1,30 @@
+# --- Web Server (Нові) ---
+fastapi
+uvicorn
+python-multipart
+
+# --- AI & Computer Vision (Ваші) ---
+numpy==1.26.4
+faiss-cpu==1.12.0
+insightface==0.7.3
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
+ultralytics==8.3.199
+onnxruntime>=1.17.0
+
+# --- Deep Learning Frameworks ---
+torch==2.5.1
+torchvision==0.20.1
+transformers==4.56.1
+
+# --- Data & Utils ---
+pandas==2.3.2
+Pillow==11.3.0
+pymongo==4.15.0
+python-dotenv==1.1.1
+matplotlib==3.7.1
+
+# --- Legacy / Scripts (Можна залишити для сумісності) ---
+PyAutoGUI==0.9.54
+streamlit>=1.28.0
+plotly>=5.18.0

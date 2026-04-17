@@ -1,12 +1,24 @@
 .env
 
-detection/detections
-detection/snapshots
-detection/vid
-.vscode/
-detection/__pycache__/
+frontend/node_modules/
+frontend/dist/
 
-venv/
-classification/data/
-classification/models/
-classification/faiss_index
+# Ігноруємо медіа та важкі моделі
+data/videos/
+data/snapshots/
+data/uploads/
+data/dataset_raw/
+data/merged_gallery/
+data/logs/
+
+# Ігноруємо дані для backend 
+backend/data/videos/
+backend/data/snapshots/
+backend/data/uploads/          
+
+*.pt
+*.mp4
+*.avi
+
+__pycache__/
+*.pyc
