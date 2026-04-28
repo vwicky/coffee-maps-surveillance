@@ -13,6 +13,9 @@ LOGS_DIR = DATA_ROOT / "logs"
 DATASET_RAW_DIR = DATA_ROOT / "dataset_raw"
 MERGED_GALLERY_DIR = DATA_ROOT / "merged_gallery"
 UPLOADS_DIR = DATA_ROOT / "uploads"
+THUMBNAILS_DIR = DATA_ROOT / "thumbnails"
+FLOOR_PLAN_PATH = DATA_ROOT / "floor_plan.jpg"
+CALIBRATION_JSON_PATH = DATA_ROOT / "calibration.json"
 ZONES_JSON_PATH = DATA_ROOT / "zones.json"
 
 
@@ -25,5 +28,6 @@ def ensure_data_dirs() -> None:
         DATASET_RAW_DIR,
         MERGED_GALLERY_DIR,
         UPLOADS_DIR,
+        THUMBNAILS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)

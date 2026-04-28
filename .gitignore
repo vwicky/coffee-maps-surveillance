@@ -1,6 +1,6 @@
 .env
 
-frontend/node_modules/
+node_modules/
 frontend/dist/
 
 # Ігноруємо медіа та важкі моделі
