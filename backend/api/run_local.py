@@ -1,11 +1,14 @@
 import cv2
+import csv
 import json
 import logging
 import numpy as np
 import os
+import shutil
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,22 +18,25 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from classification.src.face_classifier import FaceClassifier
 from app_paths import (
     CALIBRATION_JSON_PATH,
     DATA_ROOT,
     FLOOR_PLAN_PATH,
+    LOGS_DIR,
     SNAPSHOTS_DIR,
     THUMBNAILS_DIR,
     UPLOADS_DIR,
     ZONES_JSON_PATH,
     ensure_data_dirs,
 )
+from reporting.people_report_builder import build_people_final_report, build_visitors_json_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,11 +55,16 @@ ensure_data_dirs()
 UPLOAD_DIR = UPLOADS_DIR
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
-mongo_client = MongoClient("mongodb://localhost:27017/")
-mongo_db = mongo_client["cafe_analytics"]
-customers_collection = mongo_db["customers"]
-mongo_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mongo-writer")
+mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
+mongo_db = mongo_client["coffee_shop_analytics"]
+sessions_collection = mongo_db["sessions"]
 current_occupancy: dict[str, list[dict[str, int]]] = {}
+LIVE_SESSION_SNAPSHOTS_DIR = SNAPSHOTS_DIR / "live_current"
+LIVE_SESSION_ARCHIVE_DIR = SNAPSHOTS_DIR / "processed_sessions"
+live_session_lock = threading.Lock()
+active_streams = 0
+session_finalization_requested = False
+live_session_track_times: dict[int, dict[str, object]] = {}
 
 
 class Point(BaseModel):
@@ -101,31 +112,54 @@ def _save_video_thumbnail(video_path: Path) -> str | None:
     return thumb_name
 
 
-def estimate_age_gender(cropped_image_numpy_array: np.ndarray) -> tuple[int, str]:
-    """Estimate age and gender for a customer crop.
+def _ensure_live_session_dirs() -> None:
+    ensure_data_dirs()
+    LIVE_SESSION_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    LIVE_SESSION_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    Uses the existing DeepFace-based stack when available. If inference fails,
-    falls back to a clear placeholder so the user can replace it with a custom model.
-    """
-    try:
-        from deepface import DeepFace
 
-        results = DeepFace.analyze(
-            img_path=cropped_image_numpy_array,
-            actions=["age", "gender"],
-            enforce_detection=False,
-            silent=True,
-        )
-        face_data = results[0] if isinstance(results, list) else results
-        age = int(face_data.get("age", 25))
-        gender_scores = face_data.get("gender", {}) or {}
-        man_score = float(gender_scores.get("Man", 0.0))
-        woman_score = float(gender_scores.get("Woman", 0.0))
-        gender = "Female" if woman_score >= man_score else "Male"
-        return age, gender
-    except Exception:
-        # Placeholder fallback until a dedicated production model is plugged in.
-        return 25, "Female"
+def _compose_live_track_id(camera_id: int | None, track_id: int) -> int:
+    camera_component = int(camera_id) if camera_id is not None else 0
+    return camera_component * 1_000_000 + int(track_id)
+
+
+def _write_live_people_times_csv(output_path: Path, track_times: dict[int, dict[str, object]]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "ID",
+            "Enter",
+            "Exit",
+            "Duration_sec",
+            "Frames_seen",
+            "Max_conf",
+            "First_bbox",
+            "Last_bbox",
+            "Max_area",
+            "Snapshots_saved",
+            "Is_Staff",
+        ])
+        for track_id, row in sorted(track_times.items(), key=lambda item: item[0]):
+            enter_time = row.get("enter")
+            exit_time = row.get("exit")
+            if not isinstance(enter_time, datetime) or not isinstance(exit_time, datetime):
+                continue
+
+            duration = max(0.0, (exit_time - enter_time).total_seconds())
+            writer.writerow([
+                track_id,
+                enter_time.strftime("%Y-%m-%d %H:%M:%S"),
+                exit_time.strftime("%Y-%m-%d %H:%M:%S"),
+                f"{duration:.1f}",
+                row.get("frames_seen", 0),
+                f"{float(row['max_conf']):.3f}" if row.get("max_conf") is not None else "",
+                str(row.get("first_bbox", "")),
+                str(row.get("last_bbox", "")),
+                row.get("max_area", ""),
+                row.get("snapshots_saved", 0),
+                bool(row.get("is_staff", False)),
+            ])
 
 
 def _safe_crop_person(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray | None:
@@ -149,21 +183,15 @@ def _save_customer_snapshot(
     crop: np.ndarray,
     camera_id: int | None,
     track_id: int,
-) -> str | None:
-    ensure_data_dirs()
-    camera_label = camera_id if camera_id is not None else "unknown"
-    snapshot_filename = f"camera_{camera_label}_person_{track_id}.jpg"
-    snapshot_path = SNAPSHOTS_DIR / snapshot_filename
+) -> Path | None:
+    _ensure_live_session_dirs()
+    live_track_id = _compose_live_track_id(camera_id, track_id)
+    person_dir = LIVE_SESSION_SNAPSHOTS_DIR / str(live_track_id)
+    person_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = person_dir / f"shot_{int(time.time() * 1000)}.jpg"
     if not cv2.imwrite(os.fspath(snapshot_path), crop):
         return None
-    return snapshot_filename
-
-
-def _insert_customer_record(document: dict) -> None:
-    try:
-        customers_collection.insert_one(document)
-    except Exception:
-        pass
+    return snapshot_path
 
 
 def _normalize_gender_label(gender: object) -> str:
@@ -194,6 +222,54 @@ def _age_bucket_from_value(age: object) -> str:
     if age_value <= 55:
         return "46-55"
     return "56+"
+
+
+def _build_stats_group(rows: list[dict], age_order: list[str]) -> dict:
+    gender_counts: dict[str, int] = {}
+    age_counts = {label: 0 for label in age_order}
+    total_duration_sec = 0.0
+    hour_counts: dict[str, int] = {}
+
+    for row in rows:
+        gender_label = _normalize_gender_label(row.get("gender"))
+        gender_counts[gender_label] = gender_counts.get(gender_label, 0) + 1
+
+        age_label = _age_bucket_from_value(row.get("age"))
+        age_counts[age_label] = age_counts.get(age_label, 0) + 1
+
+        try:
+            total_duration_sec += float(row.get("duration_sec", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+
+        hour_value = str(row.get("hour", "") or "").strip()
+        if hour_value:
+            hour_counts[hour_value] = hour_counts.get(hour_value, 0) + 1
+
+    total_customers = len(rows)
+    peak_hour_key = max(hour_counts.items(), key=lambda item: item[1])[0] if hour_counts else "Unknown"
+
+    return {
+        "total_customers": total_customers,
+        "gender_distribution": [
+            {"label": label, "count": count}
+            for label, count in sorted(gender_counts.items(), key=lambda item: item[0])
+        ],
+        "age_groups": [{"label": label, "count": age_counts[label]} for label in age_order],
+        "average_duration_sec": (total_duration_sec / total_customers) if total_customers > 0 else 0,
+        "peak_hour": f"{peak_hour_key}:00" if peak_hour_key.isdigit() and len(peak_hour_key) == 2 else "Unknown",
+    }
+
+
+def _session_date_key(session_id: object) -> str:
+    session_value = str(session_id or "").strip()
+    parts = session_value.split("_")
+    if len(parts) >= 3:
+        try:
+            return datetime.strptime(parts[1], "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return "Unknown Date"
 
 
 def _zone_key_for_filename(filename: str) -> str:
@@ -233,9 +309,9 @@ def _load_calibration_for_filename(filename: str):
 
 
 def _merge_projected_points(
-    occupancy_by_camera: dict[str, list[dict[str, int]]],
+    occupancy_by_camera: dict[str, list[dict[str, object]]],
     distance_threshold: float = 50.0,
-) -> list[dict[str, int]]:
+) -> list[dict[str, object]]:
     clusters: list[dict[str, object]] = []
 
     for camera_filename, points in occupancy_by_camera.items():
@@ -264,6 +340,7 @@ def _merge_projected_points(
                         "x": float(x),
                         "y": float(y),
                         "count": 1,
+                        "is_staff": point.get("is_staff", False),
                         "cameras": {camera_filename},
                     }
                 )
@@ -273,21 +350,94 @@ def _merge_projected_points(
             best_cluster["x"] = (float(best_cluster["x"]) * count + x) / (count + 1)
             best_cluster["y"] = (float(best_cluster["y"]) * count + y) / (count + 1)
             best_cluster["count"] = count + 1
+            best_cluster["is_staff"] = bool(best_cluster.get("is_staff", False) or point.get("is_staff", False))
             best_cluster["cameras"].add(camera_filename)
 
     return [
-        {"x": int(round(float(cluster["x"]))), "y": int(round(float(cluster["y"])))}
+        {
+            "x": int(round(float(cluster["x"]))),
+            "y": int(round(float(cluster["y"]))),
+            "is_staff": bool(cluster.get("is_staff", False)),
+        }
         for cluster in clusters
     ]
+
+
+def _finalize_live_session(session_id: str) -> None:
+    global live_session_track_times, session_finalization_requested
+    archive_dir: Path | None = None
+
+    try:
+        deadline = time.time() + 10.0
+        while True:
+            with live_session_lock:
+                streams_left = active_streams
+            if streams_left == 0 or time.time() >= deadline:
+                break
+            time.sleep(0.25)
+
+        with live_session_lock:
+            _ensure_live_session_dirs()
+            has_snapshots = any(path.is_dir() for path in LIVE_SESSION_SNAPSHOTS_DIR.iterdir())
+            if not has_snapshots:
+                logger.info("No live snapshots found to finalize for %s", session_id)
+                return
+
+            people_times_csv = LIVE_SESSION_SNAPSHOTS_DIR / "people_times.csv"
+            _write_live_people_times_csv(people_times_csv, live_session_track_times)
+            archive_dir = LIVE_SESSION_ARCHIVE_DIR / session_id
+            shutil.move(os.fspath(LIVE_SESSION_SNAPSHOTS_DIR), os.fspath(archive_dir))
+            LIVE_SESSION_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        analyzer = FaceClassifier(ctx_id=-1, load_previous_faces=False)
+        analyzer.mongo_metadata_manager.create_session(
+            session_id,
+            str(archive_dir),
+            "live session finalization",
+        )
+
+        people_times_csv = archive_dir / "people_times.csv"
+        analyzer.analyze_folder(
+            str(archive_dir),
+            session_id,
+            people_times_csv_path=str(people_times_csv),
+        )
+
+        report_path = build_people_final_report(
+            mongo_manager=analyzer.mongo_metadata_manager,
+            session_id=session_id,
+            people_times_csv_path=str(people_times_csv),
+            output_csv_path=str(LOGS_DIR / f"people_final_report_{session_id}.csv"),
+        )
+        build_visitors_json_report(
+            merged_csv_path=report_path,
+            output_json_path=str(LOGS_DIR / f"visitors_report_{session_id}.json"),
+        )
+        logger.info("Finished live session finalization for %s", session_id)
+    except Exception:
+        logger.exception("Failed to finalize live session %s", session_id)
+    finally:
+        if archive_dir is not None:
+            shutil.rmtree(archive_dir, ignore_errors=True)
+        with live_session_lock:
+            live_session_track_times = {}
+            session_finalization_requested = False
 
 
 def generate_yolo_frames(video_path, filename, camera_id=None):
     from ultralytics import YOLO
 
+    global active_streams, live_session_track_times
     logger.info("Starting stream for %s", filename)
     print(f"▶️ STREAM STARTED: {filename}")
+    _ensure_live_session_dirs()
+    with live_session_lock:
+        if active_streams == 0:
+            live_session_track_times.clear()
+        active_streams += 1
     model = YOLO("yolov8s.pt")
     processed_customer_ids = set()
+    track_zone_stats = {}
     homography_status_logged = False
     logger.info("Opening video source: %s", video_path)
     capture = cv2.VideoCapture(os.fspath(video_path))
@@ -316,9 +466,9 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
     try:
         for r in results_generator:
             annotated_frame = r.orig_img.copy()
-            projected_points: list[dict[str, int]] = []
+            projected_points: list[dict[str, object]] = []
             try:
-                current_time = time.time()
+                current_time = datetime.now()
                 height, width = annotated_frame.shape[:2]
                 raw_zone = _load_zone_for_filename(filename)
                 calibration = _load_calibration_for_filename(filename)
@@ -372,12 +522,69 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
                     for i, box in enumerate(boxes):
                         x1, y1, x2, y2 = map(int, box)
                         tid = track_ids[i] if i < len(track_ids) else None
+                        if tid is not None:
+                            tid = int(tid)
                         center_x = int((x1 + x2) / 2)
+                        center_y = int((y1 + y2) / 2)
                         bottom_y = int(y2)
 
-                        is_staff = False
+                        in_zone_now = False
                         if barista_zone is not None:
-                            is_staff = cv2.pointPolygonTest(barista_zone, (center_x, bottom_y), False) >= 0
+                            in_zone_now = (
+                                cv2.pointPolygonTest(barista_zone, (center_x, center_y), False) >= 0
+                                or cv2.pointPolygonTest(barista_zone, (center_x, bottom_y), False) >= 0
+                            )
+
+                        if tid is not None:
+                            if tid not in track_zone_stats:
+                                track_zone_stats[tid] = {"total_frames": 0, "in_zone_frames": 0}
+
+                            track_zone_stats[tid]["total_frames"] += 1
+                            if in_zone_now:
+                                track_zone_stats[tid]["in_zone_frames"] += 1
+
+                            ratio = (
+                                track_zone_stats[tid]["in_zone_frames"]
+                                / track_zone_stats[tid]["total_frames"]
+                            )
+                            is_staff = ratio >= 0.5
+                        else:
+                            is_staff = in_zone_now
+
+                        live_track_id = _compose_live_track_id(camera_id, tid) if tid is not None else None
+                        confidence = None
+                        if hasattr(r.boxes, "conf") and r.boxes.conf is not None and i < len(r.boxes.conf):
+                            confidence = float(r.boxes.conf[i])
+
+                        if live_track_id is not None:
+                            with live_session_lock:
+                                track_time = live_session_track_times.setdefault(
+                                    live_track_id,
+                                    {
+                                        "enter": current_time,
+                                        "exit": current_time,
+                                        "frames_seen": 0,
+                                        "max_conf": None,
+                                        "first_bbox": [x1, y1, x2, y2],
+                                        "last_bbox": [x1, y1, x2, y2],
+                                        "max_area": 0,
+                                        "snapshots_saved": 0,
+                                        "is_staff": False,
+                                    },
+                                )
+                                track_time["exit"] = current_time
+                                track_time["frames_seen"] = int(track_time.get("frames_seen", 0)) + 1
+                                track_time["last_bbox"] = [x1, y1, x2, y2]
+                                area = max(0, (x2 - x1) * (y2 - y1))
+                                track_time["max_area"] = max(int(track_time.get("max_area", 0) or 0), area)
+                                if confidence is not None:
+                                    prev_conf = track_time.get("max_conf")
+                                    track_time["max_conf"] = (
+                                        confidence
+                                        if prev_conf is None
+                                        else max(float(prev_conf), confidence)
+                                    )
+                                track_time["is_staff"] = bool(is_staff)
 
                         if is_staff:
                             label = "Staff"
@@ -388,7 +595,7 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
 
                         map_x = None
                         map_y = None
-                        if not is_staff and homography_matrix is not None:
+                        if homography_matrix is not None:
                             try:
                                 pt = np.array([[[center_x, bottom_y]]], dtype=np.float32)
                                 mapped_pt = cv2.perspectiveTransform(pt, homography_matrix)[0][0]
@@ -406,32 +613,37 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
                                 )
 
                         if map_x is not None and map_y is not None:
-                            projected_points.append({"x": map_x, "y": map_y})
+                            projected_points.append({"x": map_x, "y": map_y, "is_staff": bool(is_staff)})
 
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), bg_color, 2)
 
                         if not is_staff and tid is not None:
-                            tid = int(tid)
-                            if tid not in processed_customer_ids:
+                            with live_session_lock:
+                                should_save_snapshot = not session_finalization_requested
+
+                            if should_save_snapshot and tid not in processed_customer_ids:
                                 crop = _safe_crop_person(r.orig_img, (x1, y1, x2, y2))
                                 if crop is not None:
-                                    estimated_age, estimated_gender = estimate_age_gender(crop)
-                                    snapshot_filename = _save_customer_snapshot(crop, camera_id, tid)
-                                    if snapshot_filename is not None:
+                                    snapshot_path = _save_customer_snapshot(crop, camera_id, tid)
+                                    if snapshot_path is not None:
                                         processed_customer_ids.add(tid)
-                                        mongo_executor.submit(
-                                            _insert_customer_record,
-                                            {
-                                                "camera_id": camera_id,
-                                                "track_id": tid,
-                                                "entry_time": current_time,
-                                                "age": estimated_age,
-                                                "gender": estimated_gender,
-                                                "map_x": map_x,
-                                                "map_y": map_y,
-                                                "snapshot_filename": snapshot_filename,
-                                            },
-                                        )
+                                        if live_track_id is not None:
+                                            with live_session_lock:
+                                                track_time = live_session_track_times.setdefault(
+                                                    live_track_id,
+                                                    {
+                                                        "enter": current_time,
+                                                        "exit": current_time,
+                                                        "frames_seen": 0,
+                                                        "max_conf": None,
+                                                        "first_bbox": [x1, y1, x2, y2],
+                                                        "last_bbox": [x1, y1, x2, y2],
+                                                        "max_area": max(0, (x2 - x1) * (y2 - y1)),
+                                                        "snapshots_saved": 0,
+                                                        "is_staff": False,
+                                                    },
+                                                )
+                                                track_time["snapshots_saved"] = 1
 
                         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                         cv2.rectangle(annotated_frame, (x1, y1 - 25), (x1 + tw, y1), bg_color, -1)
@@ -451,6 +663,10 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
     finally:
         current_occupancy[filename] = []
+        with live_session_lock:
+            _ensure_live_session_dirs()
+            _write_live_people_times_csv(LIVE_SESSION_SNAPSHOTS_DIR / "people_times.csv", live_session_track_times)
+            active_streams = max(0, active_streams - 1)
 
 # НОВИЙ ЕНДПОІНТ: Збереження зони з React
 @app.post("/set_zone/{filename}")
@@ -532,44 +748,86 @@ async def upload_video(
     }
 
 
+@app.post("/api/end_session")
+async def end_session(background_tasks: BackgroundTasks):
+    global session_finalization_requested
+
+    session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    with live_session_lock:
+        _ensure_live_session_dirs()
+        has_snapshots = any(path.is_dir() for path in LIVE_SESSION_SNAPSHOTS_DIR.iterdir())
+        if session_finalization_requested:
+            return {"status": "already_processing"}
+        if not has_snapshots:
+            return {"status": "no_snapshots"}
+        session_finalization_requested = True
+
+    background_tasks.add_task(_finalize_live_session, session_id)
+    return {
+        "status": "success",
+        "message": "Session finalization started in background",
+        "session_id": session_id,
+    }
+
+
 @app.get("/api/stats")
 async def get_stats():
     age_order = ["0-17", "18-25", "26-35", "36-45", "46-55", "56+", "Unknown"]
+    empty_group = {
+        "total_customers": 0,
+        "gender_distribution": [],
+        "age_groups": [{"label": label, "count": 0} for label in age_order],
+        "average_duration_sec": 0,
+        "peak_hour": "Unknown",
+    }
 
     try:
-        rows = list(customers_collection.find({}, {"_id": 0, "age": 1, "gender": 1}))
+        sessions = list(sessions_collection.find({}, {"_id": 0, "session_id": 1, "faces": 1}))
     except Exception as exc:
-        return {
-            "gender_distribution": [],
-            "age_groups": [{"label": label, "count": 0} for label in age_order],
-            "total_customers": 0,
-            "error": f"Could not load analytics: {exc}",
-        }
+        logger.warning("Could not load analytics stats: %s", exc)
+        return {"overall": empty_group, "by_date": {}}
 
-    if not rows:
-        return {
-            "gender_distribution": [],
-            "age_groups": [{"label": label, "count": 0} for label in age_order],
-            "total_customers": 0,
-        }
+    if not sessions:
+        return {"overall": empty_group, "by_date": {}}
 
-    gender_counts: dict[str, int] = {}
-    age_counts = {label: 0 for label in age_order}
+    overall_rows: list[dict] = []
+    rows_by_date: dict[str, list[dict]] = {}
 
-    for row in rows:
-        gender_label = _normalize_gender_label(row.get("gender"))
-        gender_counts[gender_label] = gender_counts.get(gender_label, 0) + 1
+    for session in sessions:
+        faces = session.get("faces", [])
+        if not isinstance(faces, list):
+            continue
 
-        age_label = _age_bucket_from_value(row.get("age"))
-        age_counts[age_label] = age_counts.get(age_label, 0) + 1
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+
+            additional_metadata = face.get("additional_metadata", {}) or {}
+            if bool(additional_metadata.get("is_staff", False)):
+                continue
+
+            enter_time = str(additional_metadata.get("enter_time", "") or "").strip()
+            date_key = enter_time[:10] if len(enter_time) >= 10 else "Unknown Date"
+            hour_str = enter_time[11:13] if len(enter_time) >= 13 else "Unknown"
+
+            face_row = {
+                "age": face.get("classification_result", {}).get("age"),
+                "gender": face.get("classification_result", {}).get("sex"),
+                "duration_sec": additional_metadata.get("duration_sec", 0),
+                "hour": hour_str,
+            }
+            overall_rows.append(face_row)
+            rows_by_date.setdefault(date_key, []).append(face_row)
+
+    if not overall_rows:
+        return {"overall": empty_group, "by_date": {}}
 
     return {
-        "gender_distribution": [
-            {"label": label, "count": count}
-            for label, count in sorted(gender_counts.items(), key=lambda item: item[0])
-        ],
-        "age_groups": [{"label": label, "count": age_counts[label]} for label in age_order],
-        "total_customers": len(rows),
+        "overall": _build_stats_group(overall_rows, age_order),
+        "by_date": {
+            date_key: _build_stats_group(date_rows, age_order)
+            for date_key, date_rows in sorted(rows_by_date.items(), key=lambda item: item[0], reverse=True)
+        },
     }
 
 

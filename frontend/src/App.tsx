@@ -33,11 +33,17 @@ interface ChartDatum {
   count: number;
 }
 
-interface StatsResponse {
+interface StatsGroup {
+  total_customers: number;
   gender_distribution: ChartDatum[];
   age_groups: ChartDatum[];
-  total_customers: number;
-  error?: string;
+  average_duration_sec?: number;
+  peak_hour?: string;
+}
+
+interface StatsResponse {
+  overall: StatsGroup;
+  by_date: Record<string, StatsGroup>;
 }
 
 const GENERIC_THUMBNAIL_URL =
@@ -668,7 +674,8 @@ function AnalyticsDashboard() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [livePoints, setLivePoints] = useState<{ x: number; y: number }[]>([]);
+  const [livePoints, setLivePoints] = useState<{ x: number; y: number; is_staff?: boolean }[]>([]);
+  const [pointHistory, setPointHistory] = useState<{ x: number; y: number; timestamp: number; is_staff?: boolean }[]>([]);
   const [floorPlanError, setFloorPlanError] = useState(false);
   const [floorPlanSize, setFloorPlanSize] = useState({ width: 1000, height: 1000 });
 
@@ -682,7 +689,7 @@ function AnalyticsDashboard() {
         const response = await fetch(`${API_ROOT}/api/stats`);
         const data: StatsResponse = await response.json();
         if (!response.ok) {
-          throw new Error(data.error || "Не вдалося завантажити аналітику.");
+          throw new Error("Не вдалося завантажити аналітику.");
         }
         if (!cancelled) {
           setStats(data);
@@ -712,7 +719,17 @@ function AnalyticsDashboard() {
         const response = await fetch(`${API_ROOT}/api/occupancy`);
         const data = await response.json();
         if (!cancelled) {
-          setLivePoints(Array.isArray(data.points) ? data.points : []);
+          const nextPoints = Array.isArray(data.points) ? data.points : [];
+          const now = Date.now();
+          setLivePoints(nextPoints);
+          setPointHistory((prev) => {
+            const validOld = prev.filter((point) => now - point.timestamp < 8000);
+            const newPoints = nextPoints.map((point: { x: number; y: number; is_staff?: boolean }) => ({
+              ...point,
+              timestamp: now,
+            }));
+            return [...validOld, ...newPoints];
+          });
         }
       } catch (err) {
         if (!cancelled) {
@@ -731,16 +748,54 @@ function AnalyticsDashboard() {
     };
   }, []);
 
-  const genderData = stats?.gender_distribution ?? [];
-  const ageData = stats?.age_groups ?? [];
+  const genderData = stats?.overall.gender_distribution ?? [];
+  const ageData = stats?.overall.age_groups ?? [];
+  const byDateEntries = Object.entries(stats?.by_date ?? {});
+
+  const formatDuration = (seconds: number) => {
+    const safeSeconds = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0;
+    const minutes = Math.floor(safeSeconds / 60);
+    const remainingSeconds = safeSeconds % 60;
+    return `${minutes} хв ${remainingSeconds} с`;
+  };
+
+  const formatBreakdown = (items: ChartDatum[], labelMap?: Record<string, string>) =>
+    items.length > 0
+      ? items
+          .map((item) => `${labelMap?.[item.label] ?? item.label}: ${item.count}`)
+          .join(", ")
+      : "Немає даних";
 
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3 lg:col-span-2">
+        <Card className="rounded-2xl border-slate-200 shadow-sm">
+          <CardContent className="p-6">
+            <p className="text-sm font-medium text-slate-500">Всього клієнтів</p>
+            <p className="mt-2 text-3xl font-bold text-slate-900">{stats?.overall?.total_customers ?? 0}</p>
+          </CardContent>
+        </Card>
+        <Card className="rounded-2xl border-slate-200 shadow-sm">
+          <CardContent className="p-6">
+            <p className="text-sm font-medium text-slate-500">Середній час перебування</p>
+            <p className="mt-2 text-3xl font-bold text-slate-900">
+              {formatDuration(stats?.overall?.average_duration_sec ?? 0)}
+            </p>
+          </CardContent>
+        </Card>
+        <Card className="rounded-2xl border-slate-200 shadow-sm">
+          <CardContent className="p-6">
+            <p className="text-sm font-medium text-slate-500">Година пік</p>
+            <p className="mt-2 text-3xl font-bold text-slate-900">{stats?.overall?.peak_hour ?? "Unknown"}</p>
+          </CardContent>
+        </Card>
+      </div>
+
       <Card className="rounded-2xl border-slate-200 shadow-sm">
         <CardContent className="p-6">
           <div className="mb-4 flex items-center justify-between border-b pb-2">
             <h2 className="text-lg font-semibold text-slate-900">Gender Distribution</h2>
-            <span className="text-sm text-slate-500">Всього: {stats?.total_customers ?? 0}</span>
+            <span className="text-sm text-slate-500">Всього: {stats?.overall.total_customers ?? 0}</span>
           </div>
           {loading ? (
             <p className="text-sm text-slate-500">Завантаження аналітики...</p>
@@ -798,6 +853,54 @@ function AnalyticsDashboard() {
 
       <Card className="rounded-2xl border-slate-200 shadow-sm lg:col-span-2">
         <CardContent className="p-6">
+          <div className="mb-4 border-b pb-2">
+            <h2 className="text-lg font-semibold text-slate-900">Статистика по датах</h2>
+          </div>
+          {loading ? (
+            <p className="text-sm text-slate-500">Завантаження статистики по датах...</p>
+          ) : error ? (
+            <p className="text-sm text-red-500">{error}</p>
+          ) : byDateEntries.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-slate-200 text-sm">
+                <thead>
+                  <tr className="text-left text-slate-500">
+                    <th className="py-3 pr-4 font-medium">Date</th>
+                    <th className="py-3 pr-4 font-medium">Total Customers</th>
+                    <th className="py-3 pr-4 font-medium">Сер. час</th>
+                    <th className="py-3 pr-4 font-medium">Година пік</th>
+                    <th className="py-3 pr-4 font-medium">Gender</th>
+                    <th className="py-3 font-medium">Age</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {byDateEntries.map(([date, group]) => (
+                    <tr key={date} className="align-top">
+                      <td className="py-3 pr-4 font-medium text-slate-900">{date}</td>
+                      <td className="py-3 pr-4 text-slate-700">{group.total_customers}</td>
+                      <td className="py-3 pr-4 text-slate-700">{formatDuration(group?.average_duration_sec ?? 0)}</td>
+                      <td className="py-3 pr-4 text-slate-700">{group?.peak_hour ?? "Unknown"}</td>
+                      <td className="py-3 pr-4 text-slate-600">
+                        {formatBreakdown(group.gender_distribution, {
+                          Male: "M",
+                          Female: "F",
+                          "Unknown / other": "Other",
+                        })}
+                      </td>
+                      <td className="py-3 text-slate-600">{formatBreakdown(group.age_groups.filter((item) => item.count > 0))}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="text-sm text-slate-500">Ще немає статистики по датах.</p>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl border-slate-200 shadow-sm lg:col-span-2">
+        <CardContent className="p-6">
           <div className="mb-4 flex items-center justify-between border-b pb-2">
             <h2 className="text-lg font-semibold text-slate-900">Live 2D Map (Дедупліковано)</h2>
             <span className="text-sm text-slate-500">Активних точок: {livePoints.length}</span>
@@ -823,18 +926,43 @@ function AnalyticsDashboard() {
                   viewBox={`0 0 ${floorPlanSize.width} ${floorPlanSize.height}`}
                   preserveAspectRatio="xMidYMid meet"
                 >
+                  {pointHistory.map((pt, i) => {
+                    const age = Date.now() - pt.timestamp;
+                    const fadeRatio = 1 - age / 8000;
+                    if (fadeRatio <= 0) {
+                      return null;
+                    }
+                    return (
+                      <circle
+                        key={`${pt.timestamp}-${pt.x}-${pt.y}-${i}`}
+                        cx={pt.x}
+                        cy={pt.y}
+                        r={4 * fadeRatio}
+                        fill={pt.is_staff ? "#22c55e" : "#3b82f6"}
+                        opacity={fadeRatio * 0.5}
+                      />
+                    );
+                  })}
                   {livePoints.map((point, index) => (
                     <g key={`${point.x}-${point.y}-${index}`}>
                       <circle
                         cx={point.x}
                         cy={point.y}
                         r="22"
-                        fill="#10b981"
+                        fill={point.is_staff ? "#22c55e" : "#3b82f6"}
                         opacity="0.18"
                         className="animate-ping"
                       />
-                      <circle cx={point.x} cy={point.y} r="8" fill="#10b981" opacity="0.95" />
-                      <circle cx={point.x} cy={point.y} r="12" fill="none" stroke="#6ee7b7" strokeWidth="2" opacity="0.9" />
+                      <circle cx={point.x} cy={point.y} r="8" fill={point.is_staff ? "#22c55e" : "#3b82f6"} opacity="0.95" />
+                      <circle
+                        cx={point.x}
+                        cy={point.y}
+                        r="12"
+                        fill="none"
+                        stroke={point.is_staff ? "#86efac" : "#93c5fd"}
+                        strokeWidth="2"
+                        opacity="0.9"
+                      />
                     </g>
                   ))}
                 </svg>
@@ -888,6 +1016,7 @@ export default function Dashboard() {
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
   const [activeTab, setActiveTab] = useState<ActiveTab>("live");
   const [totalCustomers, setTotalCustomers] = useState(0);
+  const [isEndingSession, setIsEndingSession] = useState(false);
   const nextCameraIdRef = useRef(1);
 
   useEffect(() => {
@@ -983,6 +1112,32 @@ export default function Dashboard() {
     }
   };
 
+  const endSession = async (clearCameras: boolean) => {
+    if (isEndingSession) {
+      return;
+    }
+
+    setIsEndingSession(true);
+    try {
+      const response = await fetch("http://localhost:8000/api/end_session", { method: "POST" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      console.log("Session finalization started:", data.session_id);
+
+      setSessionStatus("idle");
+      if (clearCameras) {
+        setCameras([]);
+      }
+    } catch (error) {
+      console.error("Помилка завершення сесії:", error);
+      alert("Не вдалося завершити сесію та запустити пост-обробку.");
+    } finally {
+      setIsEndingSession(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 p-6 font-sans">
       <div className="mx-auto max-w-6xl space-y-6">
@@ -1040,18 +1195,17 @@ export default function Dashboard() {
                   <Button
                     variant="outline"
                     className="h-10 border-slate-300 px-5 text-slate-700 hover:bg-slate-100"
-                    onClick={() => setSessionStatus("idle")}
+                    onClick={() => void endSession(false)}
+                    disabled={isEndingSession}
                   >
-                    ⏸ Зупинити
+                    {isEndingSession ? "Завершення..." : "⏸ Зупинити"}
                   </Button>
                   <Button
                     className="h-10 rounded-xl bg-slate-900 px-5 text-white hover:bg-slate-800"
-                    onClick={() => {
-                      setSessionStatus("idle");
-                      setCameras([]);
-                    }}
+                    onClick={() => void endSession(true)}
+                    disabled={isEndingSession}
                   >
-                    ⏹ Завершити
+                    {isEndingSession ? "Завершення..." : "⏹ Завершити"}
                   </Button>
                 </div>
               ))}

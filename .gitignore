@@ -10,6 +10,7 @@ data/uploads/
 data/dataset_raw/
 data/merged_gallery/
 data/logs/
+data/thumbnails/
 
 # Ігноруємо дані для backend 
 backend/data/videos/
