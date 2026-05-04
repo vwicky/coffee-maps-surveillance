@@ -1,6 +1,6 @@
 import { Card, CardContent } from "./components/ui/card";
 import { Button } from "./components/ui/button";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -26,6 +26,25 @@ interface CameraData {
 interface Point {
   x: number;
   y: number;
+}
+
+interface OccupancyPoint {
+  x: number;
+  y: number;
+  is_staff?: boolean;
+}
+
+interface OccupancyHistoryPoint extends OccupancyPoint {
+  timestamp: number;
+}
+
+interface MapZone {
+  id: string;
+  name: string;
+  xMin: number;
+  xMax: number;
+  yMin: number;
+  yMax: number;
 }
 
 interface ChartDatum {
@@ -68,25 +87,55 @@ const PIE_COLORS = ["#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#647
 const API_ROOT = "http://localhost:8000";
 const FLOOR_PLAN_URL = `${API_ROOT}/floor_plan`;
 const CALIBRATION_POINT_COLORS = ["#22c55e", "#38bdf8", "#f59e0b", "#f43f5e"];
+const DEFAULT_MAP_ZONES: MapZone[] = [
+  { id: "table1", name: "Столик 1", xMin: 10, xMax: 100, yMin: 10, yMax: 100 },
+  { id: "table2", name: "Столик 2", xMin: 120, xMax: 220, yMin: 10, yMax: 100 },
+  { id: "table3", name: "Столик 3", xMin: 240, xMax: 340, yMin: 10, yMax: 100 },
+  { id: "bar", name: "Барна стійка", xMin: 10, xMax: 200, yMin: 150, yMax: 250 },
+];
+
+async function uploadFloorPlanFile(file: File) {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(`${API_ROOT}/upload_floor_plan`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error("Не вдалося завантажити floor plan.");
+  }
+
+  return `${FLOOR_PLAN_URL}?t=${Date.now()}`;
+}
 
 function CalibrationModal({
   cam,
   onClose,
+  floorPlanImg,
+  setFloorPlanImg,
 }: {
   cam: CameraData;
   onClose: () => void;
+  floorPlanImg: string;
+  setFloorPlanImg: React.Dispatch<React.SetStateAction<string>>;
 }) {
   const [srcPts, setSrcPts] = useState<Point[]>([]);
   const [dstPts, setDstPts] = useState<Point[]>([]);
-  const [floorPlanSrc, setFloorPlanSrc] = useState(`${FLOOR_PLAN_URL}?t=${Date.now()}`);
   const [showFloorPlanUpload, setShowFloorPlanUpload] = useState(false);
   const [isUploadingFloorPlan, setIsUploadingFloorPlan] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
-    setFloorPlanSrc(`${FLOOR_PLAN_URL}?t=${Date.now()}`);
     setShowFloorPlanUpload(false);
   }, []);
+
+  useEffect(() => {
+    if (floorPlanImg) {
+      setShowFloorPlanUpload(false);
+    }
+  }, [floorPlanImg]);
 
   useEffect(() => {
     let cancelled = false;
@@ -139,22 +188,12 @@ function CalibrationModal({
     };
 
   const uploadFloorPlan = async (file: File) => {
-    const formData = new FormData();
-    formData.append("file", file);
     setIsUploadingFloorPlan(true);
 
     try {
-      const response = await fetch(`${API_ROOT}/upload_floor_plan`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error("Не вдалося завантажити floor plan.");
-      }
-
+      const floorPlanUrl = await uploadFloorPlanFile(file);
       setShowFloorPlanUpload(false);
-      setFloorPlanSrc(`${FLOOR_PLAN_URL}?t=${Date.now()}`);
+      setFloorPlanImg(floorPlanUrl);
     } catch (error) {
       console.error("Помилка завантаження floor plan:", error);
       alert("Не вдалося завантажити floor plan.");
@@ -304,7 +343,7 @@ function CalibrationModal({
                   />
                 </label>
                 <img
-                  src={floorPlanSrc}
+                  src={floorPlanImg}
                   alt="Floor plan"
                   className="h-full w-full object-contain"
                   onError={() => setShowFloorPlanUpload(true)}
@@ -346,14 +385,20 @@ function CalibrationModal({
 
 function CameraView({
   cam,
+  cameraIndex,
   sessionStatus,
   onRemove,
   onReplace,
+  floorPlanImg,
+  setFloorPlanImg,
 }: {
   cam: CameraData;
+  cameraIndex: number;
   sessionStatus: SessionStatus;
   onRemove: (id: number) => void;
   onReplace: (id: number, file: File) => void;
+  floorPlanImg: string;
+  setFloorPlanImg: React.Dispatch<React.SetStateAction<string>>;
 }) {
   const replaceInputRef = useRef<HTMLInputElement>(null);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -438,7 +483,14 @@ function CameraView({
         </div>
       )}
 
-      {showCalibration && <CalibrationModal cam={cam} onClose={() => setShowCalibration(false)} />}
+      {showCalibration && (
+        <CalibrationModal
+          cam={cam}
+          onClose={() => setShowCalibration(false)}
+          floorPlanImg={floorPlanImg}
+          setFloorPlanImg={setFloorPlanImg}
+        />
+      )}
 
       <Card
         className={
@@ -448,6 +500,14 @@ function CameraView({
         }
       >
         <CardContent className="relative flex min-h-0 flex-1 flex-col p-4">
+          <div
+            className={`pointer-events-none absolute top-6 left-6 z-10 flex items-center rounded-lg border border-slate-700/50 bg-slate-900/80 px-3 py-1.5 text-sm font-medium tracking-wide text-white shadow-sm backdrop-blur-md transition-all duration-300 ${
+              isExpanded ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+            }`}
+          >
+            Camera {cameraIndex + 1}
+          </div>
+
           {sessionStatus === "idle" && !isDrawing && (
             <div
               className={`absolute top-6 right-6 z-20 flex gap-2 transition-opacity duration-200 ${
@@ -670,14 +730,379 @@ function CameraView({
   );
 }
 
+function LiveMonitorSidePanel({
+  sessionStatus,
+  camerasCount,
+  totalCustomers,
+  floorPlanImg,
+  setFloorPlanImg,
+  mapZones,
+  setMapZones,
+}: {
+  sessionStatus: SessionStatus;
+  camerasCount: number;
+  totalCustomers: number;
+  floorPlanImg: string;
+  setFloorPlanImg: React.Dispatch<React.SetStateAction<string>>;
+  mapZones: MapZone[];
+  setMapZones: React.Dispatch<React.SetStateAction<MapZone[]>>;
+}) {
+  const [occupancy, setOccupancy] = useState<OccupancyPoint[]>([]);
+  const [pointHistory, setPointHistory] = useState<OccupancyHistoryPoint[]>([]);
+  const [floorPlanError, setFloorPlanError] = useState(false);
+  const [floorPlanSize, setFloorPlanSize] = useState({ width: 1000, height: 1000 });
+  const [mapScale, setMapScale] = useState(1);
+  const [isAnalyzingZones, setIsAnalyzingZones] = useState(false);
+  const floorPlanUploadRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (sessionStatus !== "running") {
+      setOccupancy([]);
+      setPointHistory([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadOccupancy = async () => {
+      try {
+        const response = await fetch(`${API_ROOT}/api/occupancy`);
+        const data = await response.json();
+        if (!cancelled) {
+          const nextPoints = Array.isArray(data.points) ? data.points : [];
+          const now = Date.now();
+          setOccupancy(nextPoints);
+          setPointHistory((prev) => {
+            const validOld = prev.filter((point) => now - point.timestamp < 8000);
+            const newPoints = nextPoints.map((point: OccupancyPoint) => ({
+              ...point,
+              timestamp: now,
+            }));
+            return [...validOld, ...newPoints];
+          });
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Не вдалося завантажити live points:", error);
+          setOccupancy([]);
+        }
+      }
+    };
+
+    void loadOccupancy();
+    const intervalId = window.setInterval(loadOccupancy, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [sessionStatus]);
+
+  const activeCustomers = occupancy.filter((point) => !point.is_staff).length;
+  const activeStaff = occupancy.filter((point) => point.is_staff).length;
+  const zoneCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    mapZones.forEach((zone) => {
+      counts[zone.id] = 0;
+    });
+
+    let otherCount = 0;
+
+    occupancy.forEach((point) => {
+      if (point.is_staff) {
+        return;
+      }
+
+      let foundZone = false;
+      for (const zone of mapZones) {
+        if (point.x >= zone.xMin && point.x <= zone.xMax && point.y >= zone.yMin && point.y <= zone.yMax) {
+          counts[zone.id] += 1;
+          foundZone = true;
+          break;
+        }
+      }
+
+      if (!foundZone) {
+        otherCount += 1;
+      }
+    });
+
+    return { counts, otherCount };
+  }, [mapZones, occupancy]);
+  const handleZoomIn = () => setMapScale((s) => Math.min(s + 0.2, 3));
+  const handleZoomOut = () => setMapScale((s) => Math.max(s - 0.2, 0.5));
+
+  const handleImageUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    try {
+      const floorPlanUrl = await uploadFloorPlanFile(file);
+      setFloorPlanImg(floorPlanUrl);
+      setFloorPlanError(false);
+    } catch (error) {
+      console.error("Помилка завантаження floor plan:", error);
+      alert("Не вдалося завантажити floor plan.");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
+  const handleAutoDetectZones = async () => {
+    if (!floorPlanImg) {
+      return;
+    }
+
+    setIsAnalyzingZones(true);
+    try {
+      const response = await fetch(`${API_ROOT}/api/analyze_floor_plan`, {
+        method: "POST",
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Не вдалося проаналізувати floor plan.");
+      }
+
+      setMapZones(Array.isArray(data.zones) ? data.zones : []);
+    } catch (error) {
+      console.error("Помилка auto-detect зон:", error);
+      alert("Не вдалося автоматично визначити зони.");
+    } finally {
+      setIsAnalyzingZones(false);
+    }
+  };
+
+  return (
+    <div className="flex h-fit self-start flex-col gap-6">
+      <div className="grid grid-cols-2 gap-4">
+        <Card className="rounded-2xl border-slate-200 bg-white shadow-sm">
+          <CardContent className="p-4">
+            <div className="mb-3 border-b pb-2">
+              <h2 className="text-base font-semibold text-slate-900">📊 Live Stats</h2>
+              <p className="mt-1 text-xs text-slate-500">Поточні дані з live occupancy та активної сесії.</p>
+            </div>
+            <div className="space-y-1.5 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500">Статус сесії</span>
+                <span className="font-semibold text-slate-900">
+                  {sessionStatus === "idle" ? "Очікує запуску" : sessionStatus}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500">Активних стрімів</span>
+                <span className="font-bold text-slate-950">{sessionStatus === "running" ? camerasCount : 0}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500">Точок на карті</span>
+                <span className="font-bold text-slate-950">{occupancy.length}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500">Клієнтів на карті</span>
+                <span className="font-semibold text-blue-600">{activeCustomers}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500">Staff на карті</span>
+                <span className="font-semibold text-emerald-600">{activeStaff}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500">Клієнтів у закладі</span>
+                <span className="font-semibold text-slate-900">{totalCustomers}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl border-slate-200 bg-white shadow-sm">
+          <CardContent className="p-4">
+            <h2 className="mb-2 text-base font-semibold text-slate-900">🧍 Розподіл по зонах</h2>
+            <ul className="space-y-1 text-sm text-slate-600">
+              {mapZones.map((zone) => (
+                <li key={zone.id} className="flex items-center justify-between border-b border-slate-100 pb-0.5 last:border-0">
+                  <span>{zone.name}</span>
+                  <span className="font-medium text-slate-900">
+                    {zoneCounts.counts[zone.id]} {zoneCounts.counts[zone.id] === 1 ? "людина" : "людей"}
+                  </span>
+                </li>
+              ))}
+              <li className="flex items-center justify-between pt-0.5">
+                <span className="text-slate-400">В русі / Інше</span>
+                <span className="font-medium text-slate-500">{zoneCounts.otherCount}</span>
+              </li>
+            </ul>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="h-fit min-h-[420px] rounded-2xl border-slate-200 bg-white shadow-sm">
+        <CardContent className="p-6">
+          <div className="mb-4 border-b pb-2">
+            <h2 className="text-lg font-semibold text-slate-900">Live 2D Map (Дедупліковано)</h2>
+          </div>
+          <div className="relative group/map h-auto w-full overflow-hidden rounded-lg">
+            <input
+              ref={floorPlanUploadRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              id="floorPlanUpload"
+              onChange={handleImageUpload}
+            />
+            <div className="absolute top-4 right-4 z-10 flex flex-col items-end gap-2 opacity-0 transition-all duration-300 group-hover/map:opacity-100">
+              <button
+                type="button"
+                onClick={() => void handleAutoDetectZones()}
+                className="group flex items-center overflow-hidden rounded-full border border-slate-200 bg-white/90 p-2 shadow-md backdrop-blur transition-all duration-300 hover:pl-4 disabled:cursor-not-allowed disabled:opacity-60"
+                title="Авто-розпізнавання зон"
+                disabled={isAnalyzingZones}
+              >
+                <span className="max-w-0 overflow-hidden whitespace-nowrap text-sm font-medium text-slate-700 opacity-0 transition-all duration-300 group-hover:mr-2 group-hover:max-w-[160px] group-hover:opacity-100">
+                  Авто-розпізнавання
+                </span>
+                <span className="text-lg flex-shrink-0">{isAnalyzingZones ? "…" : "🔍"}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => document.getElementById("floorPlanUpload")?.click()}
+                className="group flex items-center overflow-hidden rounded-full border border-slate-200 bg-white/90 p-2 shadow-md backdrop-blur transition-all duration-300 hover:pl-4"
+                title="Змінити план"
+              >
+                <span className="max-w-0 overflow-hidden whitespace-nowrap text-sm font-medium text-slate-700 opacity-0 transition-all duration-300 group-hover:mr-2 group-hover:max-w-[120px] group-hover:opacity-100">
+                  Змінити план
+                </span>
+                <span className="text-lg flex-shrink-0">🗺️</span>
+              </button>
+            </div>
+            {!floorPlanError ? (
+              <div className="h-auto w-full overflow-auto">
+                <div
+                  className="relative h-auto w-full"
+                  style={{
+                    transform: `scale(${mapScale})`,
+                    transformOrigin: "top left",
+                    transition: "transform 0.2s ease-in-out",
+                  }}
+                >
+                  <img
+                    src={floorPlanImg}
+                    alt="Floor plan"
+                    className="block h-auto w-full"
+                    onLoad={(event) => {
+                      setFloorPlanError(false);
+                      setFloorPlanSize({
+                        width: event.currentTarget.naturalWidth || 1000,
+                        height: event.currentTarget.naturalHeight || 1000,
+                      });
+                    }}
+                    onError={() => setFloorPlanError(true)}
+                  />
+                  <svg
+                    className="pointer-events-none absolute inset-0 h-full w-full"
+                    viewBox={`0 0 ${floorPlanSize.width} ${floorPlanSize.height}`}
+                    preserveAspectRatio="xMidYMid meet"
+                  >
+                    {mapZones.map((zone) => (
+                      <g key={zone.id}>
+                        <rect
+                          x={zone.xMin}
+                          y={zone.yMin}
+                          width={Math.max(0, zone.xMax - zone.xMin)}
+                          height={Math.max(0, zone.yMax - zone.yMin)}
+                          fill="rgba(59, 130, 246, 0.2)"
+                          stroke="#2563eb"
+                          strokeWidth="2"
+                        />
+                        <text
+                          x={zone.xMin + 8}
+                          y={zone.yMin + 20}
+                          fill="#dbeafe"
+                          fontSize="16"
+                          fontWeight="700"
+                          paintOrder="stroke"
+                          stroke="#1e3a8a"
+                          strokeWidth="0.6"
+                        >
+                          {zone.name}
+                        </text>
+                      </g>
+                    ))}
+                    {pointHistory.map((pt, i) => {
+                      const age = Date.now() - pt.timestamp;
+                      const fadeRatio = 1 - age / 8000;
+                      if (fadeRatio <= 0) {
+                        return null;
+                      }
+                      return (
+                        <circle
+                          key={`${pt.timestamp}-${pt.x}-${pt.y}-${i}`}
+                          cx={pt.x}
+                          cy={pt.y}
+                          r={4 * fadeRatio}
+                          fill={pt.is_staff ? "#22c55e" : "#3b82f6"}
+                          opacity={fadeRatio * 0.5}
+                        />
+                      );
+                    })}
+                    {occupancy.map((point, index) => (
+                      <g key={`${point.x}-${point.y}-${index}`}>
+                        <circle
+                          cx={point.x}
+                          cy={point.y}
+                          r="22"
+                          fill={point.is_staff ? "#22c55e" : "#3b82f6"}
+                          opacity="0.18"
+                          className="animate-ping"
+                        />
+                        <circle cx={point.x} cy={point.y} r="8" fill={point.is_staff ? "#22c55e" : "#3b82f6"} opacity="0.95" />
+                        <circle
+                          cx={point.x}
+                          cy={point.y}
+                          r="12"
+                          fill="none"
+                          stroke={point.is_staff ? "#86efac" : "#93c5fd"}
+                          strokeWidth="2"
+                          opacity="0.9"
+                        />
+                      </g>
+                    ))}
+                  </svg>
+                </div>
+              </div>
+            ) : (
+              <div className="flex h-full w-full items-center justify-center px-6 text-center text-sm text-slate-300">
+                Floor plan ще не завантажено. Додайте його в калібруванні камери, щоб побачити live 2D map.
+              </div>
+            )}
+            <div className="absolute right-4 bottom-4 z-10 flex flex-col gap-2 rounded-lg bg-white/80 p-1 opacity-0 shadow backdrop-blur transition-all duration-300 group-hover/map:opacity-100">
+              <button
+                type="button"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-lg font-semibold text-slate-900 hover:bg-white"
+                onClick={handleZoomIn}
+              >
+                +
+              </button>
+              <button
+                type="button"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-lg font-semibold text-slate-900 hover:bg-white"
+                onClick={handleZoomOut}
+              >
+                -
+              </button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function AnalyticsDashboard() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [livePoints, setLivePoints] = useState<{ x: number; y: number; is_staff?: boolean }[]>([]);
-  const [pointHistory, setPointHistory] = useState<{ x: number; y: number; timestamp: number; is_staff?: boolean }[]>([]);
-  const [floorPlanError, setFloorPlanError] = useState(false);
-  const [floorPlanSize, setFloorPlanSize] = useState({ width: 1000, height: 1000 });
 
   useEffect(() => {
     let cancelled = false;
@@ -708,43 +1133,6 @@ function AnalyticsDashboard() {
     loadStats();
     return () => {
       cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadLivePoints = async () => {
-      try {
-        const response = await fetch(`${API_ROOT}/api/occupancy`);
-        const data = await response.json();
-        if (!cancelled) {
-          const nextPoints = Array.isArray(data.points) ? data.points : [];
-          const now = Date.now();
-          setLivePoints(nextPoints);
-          setPointHistory((prev) => {
-            const validOld = prev.filter((point) => now - point.timestamp < 8000);
-            const newPoints = nextPoints.map((point: { x: number; y: number; is_staff?: boolean }) => ({
-              ...point,
-              timestamp: now,
-            }));
-            return [...validOld, ...newPoints];
-          });
-        }
-      } catch (err) {
-        if (!cancelled) {
-          console.error("Не вдалося завантажити live points:", err);
-          setLivePoints([]);
-        }
-      }
-    };
-
-    loadLivePoints();
-    const intervalId = window.setInterval(loadLivePoints, 1500);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(intervalId);
     };
   }, []);
 
@@ -898,83 +1286,6 @@ function AnalyticsDashboard() {
           )}
         </CardContent>
       </Card>
-
-      <Card className="rounded-2xl border-slate-200 shadow-sm lg:col-span-2">
-        <CardContent className="p-6">
-          <div className="mb-4 flex items-center justify-between border-b pb-2">
-            <h2 className="text-lg font-semibold text-slate-900">Live 2D Map (Дедупліковано)</h2>
-            <span className="text-sm text-slate-500">Активних точок: {livePoints.length}</span>
-          </div>
-          <div className="relative w-full aspect-video overflow-hidden rounded-lg bg-slate-900">
-            {!floorPlanError ? (
-              <>
-                <img
-                  src={FLOOR_PLAN_URL}
-                  alt="Floor plan"
-                  className="absolute inset-0 h-full w-full object-contain"
-                  onLoad={(event) => {
-                    setFloorPlanError(false);
-                    setFloorPlanSize({
-                      width: event.currentTarget.naturalWidth || 1000,
-                      height: event.currentTarget.naturalHeight || 1000,
-                    });
-                  }}
-                  onError={() => setFloorPlanError(true)}
-                />
-                <svg
-                  className="pointer-events-none absolute inset-0 h-full w-full"
-                  viewBox={`0 0 ${floorPlanSize.width} ${floorPlanSize.height}`}
-                  preserveAspectRatio="xMidYMid meet"
-                >
-                  {pointHistory.map((pt, i) => {
-                    const age = Date.now() - pt.timestamp;
-                    const fadeRatio = 1 - age / 8000;
-                    if (fadeRatio <= 0) {
-                      return null;
-                    }
-                    return (
-                      <circle
-                        key={`${pt.timestamp}-${pt.x}-${pt.y}-${i}`}
-                        cx={pt.x}
-                        cy={pt.y}
-                        r={4 * fadeRatio}
-                        fill={pt.is_staff ? "#22c55e" : "#3b82f6"}
-                        opacity={fadeRatio * 0.5}
-                      />
-                    );
-                  })}
-                  {livePoints.map((point, index) => (
-                    <g key={`${point.x}-${point.y}-${index}`}>
-                      <circle
-                        cx={point.x}
-                        cy={point.y}
-                        r="22"
-                        fill={point.is_staff ? "#22c55e" : "#3b82f6"}
-                        opacity="0.18"
-                        className="animate-ping"
-                      />
-                      <circle cx={point.x} cy={point.y} r="8" fill={point.is_staff ? "#22c55e" : "#3b82f6"} opacity="0.95" />
-                      <circle
-                        cx={point.x}
-                        cy={point.y}
-                        r="12"
-                        fill="none"
-                        stroke={point.is_staff ? "#86efac" : "#93c5fd"}
-                        strokeWidth="2"
-                        opacity="0.9"
-                      />
-                    </g>
-                  ))}
-                </svg>
-              </>
-            ) : (
-              <div className="flex h-full w-full items-center justify-center px-6 text-center text-sm text-slate-300">
-                Floor plan ще не завантажено. Додайте його в калібруванні камери, щоб побачити live 2D map.
-              </div>
-            )}
-          </div>
-        </CardContent>
-      </Card>
     </div>
   );
 }
@@ -1016,6 +1327,8 @@ export default function Dashboard() {
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
   const [activeTab, setActiveTab] = useState<ActiveTab>("live");
   const [totalCustomers, setTotalCustomers] = useState(0);
+  const [floorPlanImg, setFloorPlanImg] = useState(FLOOR_PLAN_URL);
+  const [mapZones, setMapZones] = useState<MapZone[]>(DEFAULT_MAP_ZONES);
   const [isEndingSession, setIsEndingSession] = useState(false);
   const nextCameraIdRef = useRef(1);
 
@@ -1139,8 +1452,8 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 p-6 font-sans">
-      <div className="mx-auto max-w-6xl space-y-6">
+    <div className="min-h-screen bg-slate-50 font-sans">
+      <div className="grid w-full gap-6 px-[30px] py-6">
         <header className="flex flex-col justify-between gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm transition-all duration-300 lg:flex-row lg:items-center">
           <div>
             <h1 className="text-xl font-bold text-slate-900">☕ Cafe Monitor</h1>
@@ -1159,11 +1472,6 @@ export default function Dashboard() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            {sessionStatus === "running" && (
-              <div className="rounded-full bg-red-50 px-4 py-2 text-sm font-semibold text-red-600 border border-red-200">
-                🔴 Live: {totalCustomers} клієнтів у закладі
-              </div>
-            )}
             <div className="flex gap-2">
               <Button
                 onClick={() => setActiveTab("live")}
@@ -1213,56 +1521,36 @@ export default function Dashboard() {
         </header>
 
         <div className={activeTab === "live" ? "block" : "hidden"}>
-          <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-            {cameras.map((cam) => (
-              <CameraView
-                key={cam.id}
-                cam={cam}
+          <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+            <div className="xl:col-span-2">
+              <div className="grid auto-rows-fr grid-cols-1 gap-6 md:grid-cols-2">
+                {cameras.map((cam, index) => (
+                  <CameraView
+                    key={cam.id}
+                    cam={cam}
+                    cameraIndex={index}
+                    sessionStatus={sessionStatus}
+                    onRemove={(id) => setCameras((prev) => prev.filter((c) => c.id !== id))}
+                    onReplace={replaceCamera}
+                    floorPlanImg={floorPlanImg}
+                    setFloorPlanImg={setFloorPlanImg}
+                  />
+                ))}
+                {sessionStatus === "idle" && <AddCameraCard onUpload={addCamera} />}
+              </div>
+            </div>
+
+            <div className="xl:col-span-1 self-start h-fit">
+              <LiveMonitorSidePanel
                 sessionStatus={sessionStatus}
-                onRemove={(id) => setCameras((prev) => prev.filter((c) => c.id !== id))}
-                onReplace={replaceCamera}
+                camerasCount={cameras.length}
+                totalCustomers={totalCustomers}
+                floorPlanImg={floorPlanImg}
+                setFloorPlanImg={setFloorPlanImg}
+                mapZones={mapZones}
+                setMapZones={setMapZones}
               />
-            ))}
-            {sessionStatus === "idle" && <AddCameraCard onUpload={addCamera} />}
-          </div>
-
-          <div className="grid grid-cols-1 gap-6 pt-10 md:grid-cols-2">
-            <Card className="rounded-2xl border-slate-200 bg-white shadow-sm">
-              <CardContent className="p-6">
-                <h2 className="mb-4 border-b pb-2 text-lg font-semibold text-slate-900">
-                  🧍 Аналітика сесії
-                </h2>
-                <ul className="space-y-2 text-sm text-slate-600">
-                  {cameras.length > 0 && sessionStatus === "running" ? (
-                    <li className="font-medium text-green-600 animate-pulse">
-                      Система активна. Стрімів: {cameras.length}. Йде трекінг клієнтів...
-                    </li>
-                  ) : cameras.length > 0 ? (
-                    <li className="font-medium text-slate-500">
-                      Підключено камер: {cameras.length}. Статус: Очікує запуску.
-                    </li>
-                  ) : (
-                    <li className="italic text-slate-400">Очікування підключення камер...</li>
-                  )}
-                </ul>
-              </CardContent>
-            </Card>
-
-            <Card className="rounded-2xl border-slate-200 bg-white shadow-sm">
-              <CardContent className="p-6">
-                <h2 className="mb-4 border-b pb-2 text-lg font-semibold text-slate-900">
-                  📊 Статистика YOLO
-                </h2>
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-500">Активних стрімів:</span>
-                    <span className="text-xl font-bold text-slate-950">
-                      {sessionStatus === "running" ? cameras.length : 0}
-                    </span>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
+            </div>
           </div>
         </div>
 

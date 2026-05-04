@@ -261,6 +261,368 @@ def _build_stats_group(rows: list[dict], age_order: list[str]) -> dict:
     }
 
 
+def _build_buffered_zone(
+    text: str,
+    x_min: int,
+    x_max: int,
+    y_min: int,
+    y_max: int,
+    image_width: int,
+    image_height: int,
+    index: int,
+    padding: int = 40,
+) -> dict[str, object]:
+    safe_name = str(text or "").strip() or f"Detected {index}"
+    safe_id = "".join(ch.lower() if ch.isalnum() else "_" for ch in safe_name).strip("_")
+    safe_id = safe_id or f"auto_{index}"
+    return {
+        "id": f"{safe_id}_{index}",
+        "name": safe_name,
+        "xMin": max(0, int(x_min) - padding),
+        "xMax": min(int(image_width), int(x_max) + padding),
+        "yMin": max(0, int(y_min) - padding),
+        "yMax": min(int(image_height), int(y_max) + padding),
+    }
+
+
+def _extract_floor_plan_contours(image: np.ndarray) -> list[np.ndarray]:
+    image_height, image_width = image.shape[:2]
+    total_area = max(1, image_width * image_height)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    threshold = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        21,
+        9,
+    )
+    combined = cv2.bitwise_or(edges, threshold)
+    kernel = np.ones((3, 3), np.uint8)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
+    combined = cv2.dilate(combined, kernel, iterations=1)
+    contours, _ = cv2.findContours(combined, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    valid_contours: list[np.ndarray] = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 1500:
+            continue
+        if area > 0.8 * total_area:
+            continue
+        valid_contours.append(contour)
+    return valid_contours
+
+
+def _rotate_point_from_clockwise_image(
+    x: float,
+    y: float,
+    original_height: int,
+) -> tuple[int, int]:
+    return int(round(y)), max(0, int(round(original_height - x - 1)))
+
+
+def _rotate_point_from_counterclockwise_image(
+    x: float,
+    y: float,
+    original_width: int,
+) -> tuple[int, int]:
+    return max(0, int(round(original_width - y - 1))), int(round(x))
+
+
+def _build_text_box_record(
+    index: int,
+    text: str,
+    points: list[tuple[int, int]],
+    confidence: float | None = None,
+) -> dict[str, object] | None:
+    cleaned_text = str(text or "").strip()
+    if not cleaned_text:
+        return None
+    if len(cleaned_text) < 3 or cleaned_text.isnumeric():
+        return None
+    if confidence is not None and confidence < 0.5:
+        return None
+
+    xs = [int(point[0]) for point in points]
+    ys = [int(point[1]) for point in points]
+    x_min = min(xs)
+    x_max = max(xs)
+    y_min = min(ys)
+    y_max = max(ys)
+    return {
+        "index": index,
+        "text": cleaned_text,
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
+        "cx": int((x_min + x_max) / 2),
+        "cy": int((y_min + y_max) / 2),
+        "confidence": confidence,
+    }
+
+
+def _dedupe_text_boxes(text_boxes: list[dict[str, object]]) -> list[dict[str, object]]:
+    deduped: list[dict[str, object]] = []
+
+    for text_box in text_boxes:
+        is_duplicate = False
+        for existing_index, existing in enumerate(deduped):
+            same_text = str(text_box["text"]).lower() == str(existing["text"]).lower()
+            close_x = abs(int(text_box["cx"]) - int(existing["cx"])) <= 30
+            close_y = abs(int(text_box["cy"]) - int(existing["cy"])) <= 30
+            if same_text and close_x and close_y:
+                existing_conf = float(existing.get("confidence") or 0.0)
+                current_conf = float(text_box.get("confidence") or 0.0)
+                if current_conf > existing_conf:
+                    deduped[existing_index] = text_box
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            deduped.append(text_box)
+
+    for index, text_box in enumerate(deduped, start=1):
+        text_box["index"] = index
+
+    return deduped
+
+
+def _extract_easyocr_text_boxes(
+    image: np.ndarray,
+    *,
+    rotation_mode: str = "original",
+    original_width: int | None = None,
+    original_height: int | None = None,
+) -> list[dict[str, object]]:
+    import easyocr
+
+    reader = easyocr.Reader(["en"], gpu=False)
+    detections = reader.readtext(image)
+    text_boxes: list[dict[str, object]] = []
+
+    for index, detection in enumerate(detections, start=1):
+        if len(detection) < 2:
+            continue
+        bbox, text = detection[0], str(detection[1])
+        confidence = float(detection[2]) if len(detection) > 2 and detection[2] is not None else None
+        points = [(int(point[0]), int(point[1])) for point in bbox]
+        if rotation_mode == "cw":
+            if original_height is None:
+                raise ValueError("original_height is required for clockwise OCR coordinates")
+            points = [_rotate_point_from_clockwise_image(x, y, original_height) for x, y in points]
+        elif rotation_mode == "ccw":
+            if original_width is None:
+                raise ValueError("original_width is required for counterclockwise OCR coordinates")
+            points = [_rotate_point_from_counterclockwise_image(x, y, original_width) for x, y in points]
+
+        text_box = _build_text_box_record(index, text, points, confidence=confidence)
+        if text_box is not None:
+            text_boxes.append(text_box)
+
+    return text_boxes
+
+
+def _extract_pytesseract_text_boxes(
+    image: np.ndarray,
+    *,
+    rotation_mode: str = "original",
+    original_width: int | None = None,
+    original_height: int | None = None,
+) -> list[dict[str, object]]:
+    import pytesseract
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    processed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    data = pytesseract.image_to_data(processed, output_type=pytesseract.Output.DICT)
+    grouped: dict[tuple[int, int, int], dict[str, object]] = {}
+    total_items = len(data.get("text", []))
+
+    for idx in range(total_items):
+        text = str(data["text"][idx] or "").strip()
+        if not text:
+            continue
+
+        try:
+            confidence = float(data["conf"][idx])
+        except (TypeError, ValueError):
+            confidence = -1.0
+        if confidence < 0:
+            continue
+
+        key = (
+            int(data["block_num"][idx]),
+            int(data["par_num"][idx]),
+            int(data["line_num"][idx]),
+        )
+        left = int(data["left"][idx])
+        top = int(data["top"][idx])
+        width = int(data["width"][idx])
+        height = int(data["height"][idx])
+
+        group = grouped.setdefault(
+            key,
+            {
+                "texts": [],
+                "confidences": [],
+                "x_min": left,
+                "x_max": left + width,
+                "y_min": top,
+                "y_max": top + height,
+            },
+        )
+        group["texts"].append(text)
+        group["confidences"].append(confidence)
+        group["x_min"] = min(int(group["x_min"]), left)
+        group["x_max"] = max(int(group["x_max"]), left + width)
+        group["y_min"] = min(int(group["y_min"]), top)
+        group["y_max"] = max(int(group["y_max"]), top + height)
+
+    text_boxes: list[dict[str, object]] = []
+    for index, group in enumerate(grouped.values(), start=1):
+        label = " ".join(group["texts"])
+        x_min = int(group["x_min"])
+        x_max = int(group["x_max"])
+        y_min = int(group["y_min"])
+        y_max = int(group["y_max"])
+        points = [
+            (x_min, y_min),
+            (x_max, y_min),
+            (x_max, y_max),
+            (x_min, y_max),
+        ]
+        if rotation_mode == "cw":
+            if original_height is None:
+                raise ValueError("original_height is required for clockwise OCR coordinates")
+            points = [_rotate_point_from_clockwise_image(x, y, original_height) for x, y in points]
+        elif rotation_mode == "ccw":
+            if original_width is None:
+                raise ValueError("original_width is required for counterclockwise OCR coordinates")
+            points = [_rotate_point_from_counterclockwise_image(x, y, original_width) for x, y in points]
+
+        confidence_values = [float(value) for value in group["confidences"] if float(value) >= 0]
+        avg_confidence = (sum(confidence_values) / len(confidence_values) / 100.0) if confidence_values else None
+        text_box = _build_text_box_record(index, label, points, confidence=avg_confidence)
+        if text_box is not None:
+            text_boxes.append(text_box)
+
+    return text_boxes
+
+
+def _build_zone_from_text_and_contours(
+    text_box: dict[str, object],
+    contours: list[np.ndarray],
+    image_width: int,
+    image_height: int,
+) -> dict[str, object]:
+    text = str(text_box["text"])
+    index = int(text_box["index"])
+    center = (float(text_box["cx"]), float(text_box["cy"]))
+
+    selected_contour: np.ndarray | None = None
+    selected_area = float("inf")
+
+    for contour in contours:
+        if cv2.pointPolygonTest(contour, center, False) < 0:
+            continue
+
+        contour_area = cv2.contourArea(contour)
+        if contour_area < selected_area:
+            selected_contour = contour
+            selected_area = contour_area
+
+    if selected_contour is not None:
+        x, y, w, h = cv2.boundingRect(selected_contour)
+        return _build_buffered_zone(
+            text,
+            x,
+            x + w,
+            y,
+            y + h,
+            image_width,
+            image_height,
+            index,
+            padding=30,
+        )
+
+    return _build_buffered_zone(
+        text,
+        int(text_box["x_min"]),
+        int(text_box["x_max"]),
+        int(text_box["y_min"]),
+        int(text_box["y_max"]),
+        image_width,
+        image_height,
+        index,
+        padding=80,
+    )
+
+
+def _detect_floor_plan_zones(image: np.ndarray) -> list[dict[str, object]]:
+    errors: list[str] = []
+    text_boxes: list[dict[str, object]] = []
+    image_height, image_width = image.shape[:2]
+    contours = _extract_floor_plan_contours(image)
+    rotated_cw_image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    rotated_ccw_image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    try:
+        text_boxes = _dedupe_text_boxes(
+            _extract_easyocr_text_boxes(image)
+            + _extract_easyocr_text_boxes(
+                rotated_cw_image,
+                rotation_mode="cw",
+                original_height=image_height,
+                original_width=image_width,
+            )
+            + _extract_easyocr_text_boxes(
+                rotated_ccw_image,
+                rotation_mode="ccw",
+                original_height=image_height,
+                original_width=image_width,
+            )
+        )
+    except ImportError:
+        errors.append("easyocr is not installed")
+    except Exception as exc:
+        logger.warning("easyocr floor-plan analysis failed: %s", exc)
+        errors.append("easyocr failed")
+
+    if not text_boxes:
+        try:
+            text_boxes = _dedupe_text_boxes(
+                _extract_pytesseract_text_boxes(image)
+                + _extract_pytesseract_text_boxes(
+                    rotated_cw_image,
+                    rotation_mode="cw",
+                    original_height=image_height,
+                    original_width=image_width,
+                )
+                + _extract_pytesseract_text_boxes(
+                    rotated_ccw_image,
+                    rotation_mode="ccw",
+                    original_height=image_height,
+                    original_width=image_width,
+                )
+            )
+        except ImportError:
+            errors.append("pytesseract is not installed")
+        except Exception as exc:
+            logger.warning("pytesseract floor-plan analysis failed: %s", exc)
+            errors.append("pytesseract failed")
+
+    if text_boxes:
+        return [
+            _build_zone_from_text_and_contours(text_box, contours, image_width, image_height)
+            for text_box in text_boxes
+        ]
+
+    if errors:
+        logger.warning("Floor-plan OCR unavailable or produced no zones: %s", "; ".join(errors))
+    return []
+
+
 def _session_date_key(session_id: object) -> str:
     session_value = str(session_id or "").strip()
     parts = session_value.split("_")
@@ -690,6 +1052,28 @@ async def upload_floor_plan(file: UploadFile = File(...)):
         buffer.write(await file.read())
     await file.close()
     return {"status": "uploaded"}
+
+
+@app.post("/api/analyze_floor_plan")
+async def analyze_floor_plan(file: UploadFile | None = File(None)):
+    if file is not None:
+        payload = await file.read()
+        await file.close()
+    else:
+        if not FLOOR_PLAN_PATH.exists():
+            raise HTTPException(status_code=404, detail="Floor plan not found")
+        payload = FLOOR_PLAN_PATH.read_bytes()
+
+    if not payload:
+        raise HTTPException(status_code=400, detail="Floor plan image is empty")
+
+    image_array = np.frombuffer(payload, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="Could not decode floor plan image")
+
+    zones = _detect_floor_plan_zones(image)
+    return {"zones": zones}
 
 
 @app.get("/floor_plan")
