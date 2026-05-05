@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import cv2
 import insightface
@@ -129,6 +130,8 @@ class FaceClassifier:
         enter_time = track_time.get("enter_time", "")
         exit_time = track_time.get("exit_time", "")
         is_staff = track_time.get("is_staff", False)
+        zone_name = str(track_time.get("zone_name", "") or "")
+        position_samples = track_time.get("position_samples", [])
         
         embedding = face.normed_embedding.astype("float32").reshape(1, -1)
         
@@ -158,6 +161,8 @@ class FaceClassifier:
                     canonical_person_key=str(existing_id),
                     duplicate_track_id=track_id,
                     duration_sec=duration_sec,
+                    zone_name=zone_name,
+                    position_samples=position_samples,
                 )
                 return None  # Merge відбувся, новий запис не створюємо
 
@@ -167,7 +172,8 @@ class FaceClassifier:
         
         additional_metadata = AdditionalMetadata(
             frame_number=track_id, bbox=face.bbox.tolist(), duration_sec=duration_sec,
-            enter_time=enter_time, exit_time=exit_time, is_staff=is_staff
+            enter_time=enter_time, exit_time=exit_time, is_staff=is_staff,
+            zone_name=zone_name, position_samples=position_samples
         )
         metadata = ClassificationMetadata(
             session_id=session_id, face_id=face_id, embedding_id=embedding_id,
@@ -340,8 +346,47 @@ class FaceClassifier:
                     "enter_time": str(row.get("Enter", "")).strip(),
                     "exit_time": str(row.get("Exit", "")).strip(),
                     "is_staff": str(row.get("Is_Staff", "")).strip().lower() == "true",
+                    "zone_name": str(row.get("Zone_Name", "")).strip(),
+                    "position_samples": self._parse_position_samples(row.get("Position_Samples", "")),
                 }
         return by_id
+
+    @staticmethod
+    def _parse_position_samples(raw_value: str) -> list[dict]:
+        payload = str(raw_value or "").strip()
+        if not payload:
+            return []
+
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            return []
+
+        if not isinstance(parsed, list):
+            return []
+
+        samples: list[dict] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            timestamp = str(item.get("timestamp", "") or "").strip()
+            try:
+                x_value = float(item.get("x"))
+                y_value = float(item.get("y"))
+            except (TypeError, ValueError):
+                continue
+
+            samples.append(
+                {
+                    "timestamp": timestamp,
+                    "x": x_value,
+                    "y": y_value,
+                    "zone_name": str(item.get("zone_name", "") or "").strip(),
+                }
+            )
+
+        samples.sort(key=lambda sample: sample.get("timestamp", ""))
+        return samples
 
     @staticmethod
     def _snapshot_try_order(root: str, image_files: list) -> list:

@@ -1,17 +1,7 @@
 import { Card, CardContent } from "./components/ui/card";
 import { Button } from "./components/ui/button";
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  Bar,
-  BarChart,
-  Cell,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import Analytics from "./pages/Analytics";
 
 type SessionStatus = "idle" | "running" | "finished";
 type ActiveTab = "live" | "analytics";
@@ -47,24 +37,6 @@ interface MapZone {
   yMax: number;
 }
 
-interface ChartDatum {
-  label: string;
-  count: number;
-}
-
-interface StatsGroup {
-  total_customers: number;
-  gender_distribution: ChartDatum[];
-  age_groups: ChartDatum[];
-  average_duration_sec?: number;
-  peak_hour?: string;
-}
-
-interface StatsResponse {
-  overall: StatsGroup;
-  by_date: Record<string, StatsGroup>;
-}
-
 const GENERIC_THUMBNAIL_URL =
   "data:image/svg+xml;utf8," +
   encodeURIComponent(`
@@ -83,16 +55,53 @@ const GENERIC_THUMBNAIL_URL =
     </svg>
   `);
 
-const PIE_COLORS = ["#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#64748b"];
 const API_ROOT = "http://localhost:8000";
 const FLOOR_PLAN_URL = `${API_ROOT}/floor_plan`;
 const CALIBRATION_POINT_COLORS = ["#22c55e", "#38bdf8", "#f59e0b", "#f43f5e"];
-const DEFAULT_MAP_ZONES: MapZone[] = [
-  { id: "table1", name: "Столик 1", xMin: 10, xMax: 100, yMin: 10, yMax: 100 },
-  { id: "table2", name: "Столик 2", xMin: 120, xMax: 220, yMin: 10, yMax: 100 },
-  { id: "table3", name: "Столик 3", xMin: 240, xMax: 340, yMin: 10, yMax: 100 },
-  { id: "bar", name: "Барна стійка", xMin: 10, xMax: 200, yMin: 150, yMax: 250 },
-];
+
+const normalizeMapZone = (zone: Partial<MapZone>, index: number): MapZone => {
+  const xMin = Number(zone.xMin ?? 0);
+  const xMax = Number(zone.xMax ?? xMin);
+  const yMin = Number(zone.yMin ?? 0);
+  const yMax = Number(zone.yMax ?? yMin);
+
+  return {
+    id: String(zone.id || `zone_${index + 1}`),
+    name: String(zone.name || `Zone ${index + 1}`),
+    xMin: Math.min(xMin, xMax),
+    xMax: Math.max(xMin, xMax),
+    yMin: Math.min(yMin, yMax),
+    yMax: Math.max(yMin, yMax),
+  };
+};
+
+async function loadFloorPlanZones(): Promise<MapZone[]> {
+  const response = await fetch(`${API_ROOT}/api/floor_plan/zones`);
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.detail || "Не вдалося завантажити зони floor plan.");
+  }
+
+  return Array.isArray(data.zones)
+    ? data.zones.map((zone: Partial<MapZone>, index: number) => normalizeMapZone(zone, index))
+    : [];
+}
+
+async function saveFloorPlanZones(zones: MapZone[]): Promise<MapZone[]> {
+  const response = await fetch(`${API_ROOT}/api/floor_plan/zones`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(zones),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.detail || "Не вдалося зберегти зони floor plan.");
+  }
+
+  return Array.isArray(data.zones)
+    ? data.zones.map((zone: Partial<MapZone>, index: number) => normalizeMapZone(zone, index))
+    : [];
+}
 
 async function uploadFloorPlanFile(file: File) {
   const formData = new FormData();
@@ -841,6 +850,7 @@ function LiveMonitorSidePanel({
     try {
       const floorPlanUrl = await uploadFloorPlanFile(file);
       setFloorPlanImg(floorPlanUrl);
+      setMapZones([]);
       setFloorPlanError(false);
     } catch (error) {
       console.error("Помилка завантаження floor plan:", error);
@@ -866,7 +876,11 @@ function LiveMonitorSidePanel({
         throw new Error(data.detail || "Не вдалося проаналізувати floor plan.");
       }
 
-      setMapZones(Array.isArray(data.zones) ? data.zones : []);
+      const detectedZones = Array.isArray(data.zones)
+        ? data.zones.map((zone: Partial<MapZone>, index: number) => normalizeMapZone(zone, index))
+        : [];
+      const savedZones = await saveFloorPlanZones(detectedZones);
+      setMapZones(savedZones);
     } catch (error) {
       console.error("Помилка auto-detect зон:", error);
       alert("Не вдалося автоматично визначити зони.");
@@ -1099,197 +1113,6 @@ function LiveMonitorSidePanel({
   );
 }
 
-function AnalyticsDashboard() {
-  const [stats, setStats] = useState<StatsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadStats = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const response = await fetch(`${API_ROOT}/api/stats`);
-        const data: StatsResponse = await response.json();
-        if (!response.ok) {
-          throw new Error("Не вдалося завантажити аналітику.");
-        }
-        if (!cancelled) {
-          setStats(data);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Не вдалося завантажити аналітику.");
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    };
-
-    loadStats();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const genderData = stats?.overall.gender_distribution ?? [];
-  const ageData = stats?.overall.age_groups ?? [];
-  const byDateEntries = Object.entries(stats?.by_date ?? {});
-
-  const formatDuration = (seconds: number) => {
-    const safeSeconds = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0;
-    const minutes = Math.floor(safeSeconds / 60);
-    const remainingSeconds = safeSeconds % 60;
-    return `${minutes} хв ${remainingSeconds} с`;
-  };
-
-  const formatBreakdown = (items: ChartDatum[], labelMap?: Record<string, string>) =>
-    items.length > 0
-      ? items
-          .map((item) => `${labelMap?.[item.label] ?? item.label}: ${item.count}`)
-          .join(", ")
-      : "Немає даних";
-
-  return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3 lg:col-span-2">
-        <Card className="rounded-2xl border-slate-200 shadow-sm">
-          <CardContent className="p-6">
-            <p className="text-sm font-medium text-slate-500">Всього клієнтів</p>
-            <p className="mt-2 text-3xl font-bold text-slate-900">{stats?.overall?.total_customers ?? 0}</p>
-          </CardContent>
-        </Card>
-        <Card className="rounded-2xl border-slate-200 shadow-sm">
-          <CardContent className="p-6">
-            <p className="text-sm font-medium text-slate-500">Середній час перебування</p>
-            <p className="mt-2 text-3xl font-bold text-slate-900">
-              {formatDuration(stats?.overall?.average_duration_sec ?? 0)}
-            </p>
-          </CardContent>
-        </Card>
-        <Card className="rounded-2xl border-slate-200 shadow-sm">
-          <CardContent className="p-6">
-            <p className="text-sm font-medium text-slate-500">Година пік</p>
-            <p className="mt-2 text-3xl font-bold text-slate-900">{stats?.overall?.peak_hour ?? "Unknown"}</p>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card className="rounded-2xl border-slate-200 shadow-sm">
-        <CardContent className="p-6">
-          <div className="mb-4 flex items-center justify-between border-b pb-2">
-            <h2 className="text-lg font-semibold text-slate-900">Gender Distribution</h2>
-            <span className="text-sm text-slate-500">Всього: {stats?.overall.total_customers ?? 0}</span>
-          </div>
-          {loading ? (
-            <p className="text-sm text-slate-500">Завантаження аналітики...</p>
-          ) : error ? (
-            <p className="text-sm text-red-500">{error}</p>
-          ) : genderData.length > 0 ? (
-            <div className="h-80">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie
-                    data={genderData}
-                    dataKey="count"
-                    nameKey="label"
-                    innerRadius={70}
-                    outerRadius={110}
-                    paddingAngle={3}
-                  >
-                    {genderData.map((entry, index) => (
-                      <Cell key={entry.label} fill={PIE_COLORS[index % PIE_COLORS.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-          ) : (
-            <p className="text-sm text-slate-500">Ще немає збережених customer-записів.</p>
-          )}
-        </CardContent>
-      </Card>
-
-      <Card className="rounded-2xl border-slate-200 shadow-sm">
-        <CardContent className="p-6">
-          <div className="mb-4 border-b pb-2">
-            <h2 className="text-lg font-semibold text-slate-900">Age Groups</h2>
-          </div>
-          {loading ? (
-            <p className="text-sm text-slate-500">Завантаження аналітики...</p>
-          ) : error ? (
-            <p className="text-sm text-red-500">{error}</p>
-          ) : (
-            <div className="h-80">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={ageData}>
-                  <XAxis dataKey="label" />
-                  <YAxis allowDecimals={false} />
-                  <Tooltip />
-                  <Bar dataKey="count" fill="#10b981" radius={[8, 8, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      <Card className="rounded-2xl border-slate-200 shadow-sm lg:col-span-2">
-        <CardContent className="p-6">
-          <div className="mb-4 border-b pb-2">
-            <h2 className="text-lg font-semibold text-slate-900">Статистика по датах</h2>
-          </div>
-          {loading ? (
-            <p className="text-sm text-slate-500">Завантаження статистики по датах...</p>
-          ) : error ? (
-            <p className="text-sm text-red-500">{error}</p>
-          ) : byDateEntries.length > 0 ? (
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-slate-200 text-sm">
-                <thead>
-                  <tr className="text-left text-slate-500">
-                    <th className="py-3 pr-4 font-medium">Date</th>
-                    <th className="py-3 pr-4 font-medium">Total Customers</th>
-                    <th className="py-3 pr-4 font-medium">Сер. час</th>
-                    <th className="py-3 pr-4 font-medium">Година пік</th>
-                    <th className="py-3 pr-4 font-medium">Gender</th>
-                    <th className="py-3 font-medium">Age</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {byDateEntries.map(([date, group]) => (
-                    <tr key={date} className="align-top">
-                      <td className="py-3 pr-4 font-medium text-slate-900">{date}</td>
-                      <td className="py-3 pr-4 text-slate-700">{group.total_customers}</td>
-                      <td className="py-3 pr-4 text-slate-700">{formatDuration(group?.average_duration_sec ?? 0)}</td>
-                      <td className="py-3 pr-4 text-slate-700">{group?.peak_hour ?? "Unknown"}</td>
-                      <td className="py-3 pr-4 text-slate-600">
-                        {formatBreakdown(group.gender_distribution, {
-                          Male: "M",
-                          Female: "F",
-                          "Unknown / other": "Other",
-                        })}
-                      </td>
-                      <td className="py-3 text-slate-600">{formatBreakdown(group.age_groups.filter((item) => item.count > 0))}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <p className="text-sm text-slate-500">Ще немає статистики по датах.</p>
-          )}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
 function AddCameraCard({ onUpload }: { onUpload: (file: File) => void }) {
   const ref = useRef<HTMLInputElement>(null);
 
@@ -1328,9 +1151,32 @@ export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("live");
   const [totalCustomers, setTotalCustomers] = useState(0);
   const [floorPlanImg, setFloorPlanImg] = useState(FLOOR_PLAN_URL);
-  const [mapZones, setMapZones] = useState<MapZone[]>(DEFAULT_MAP_ZONES);
+  const [mapZones, setMapZones] = useState<MapZone[]>([]);
   const [isEndingSession, setIsEndingSession] = useState(false);
   const nextCameraIdRef = useRef(1);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const syncFloorPlanZones = async () => {
+      try {
+        const zones = await loadFloorPlanZones();
+        if (!cancelled) {
+          setMapZones(zones);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Помилка завантаження зон floor plan:", error);
+          setMapZones([]);
+        }
+      }
+    };
+
+    void syncFloorPlanZones();
+    return () => {
+      cancelled = true;
+    };
+  }, [floorPlanImg]);
 
   useEffect(() => {
     if (sessionStatus !== "running") {
@@ -1555,7 +1401,7 @@ export default function Dashboard() {
         </div>
 
         <div className={activeTab === "analytics" ? "block" : "hidden"}>
-          <AnalyticsDashboard />
+          <Analytics />
         </div>
       </div>
     </div>

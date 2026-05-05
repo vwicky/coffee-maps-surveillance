@@ -8,8 +8,9 @@ import shutil
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
 from pymongo import MongoClient
@@ -58,6 +59,7 @@ app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails
 mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
 mongo_db = mongo_client["coffee_shop_analytics"]
 sessions_collection = mongo_db["sessions"]
+floor_plan_state_collection = mongo_db["floor_plan_state"]
 current_occupancy: dict[str, list[dict[str, int]]] = {}
 LIVE_SESSION_SNAPSHOTS_DIR = SNAPSHOTS_DIR / "live_current"
 LIVE_SESSION_ARCHIVE_DIR = SNAPSHOTS_DIR / "processed_sessions"
@@ -65,6 +67,7 @@ live_session_lock = threading.Lock()
 active_streams = 0
 session_finalization_requested = False
 live_session_track_times: dict[int, dict[str, object]] = {}
+POSITION_SAMPLE_INTERVAL_SEC = 1.0
 
 
 class Point(BaseModel):
@@ -75,6 +78,15 @@ class Point(BaseModel):
 class CalibrationPayload(BaseModel):
     src_pts: list[Point]
     dst_pts: list[Point]
+
+
+class FloorPlanZone(BaseModel):
+    id: str
+    name: str
+    xMin: float
+    xMax: float
+    yMin: float
+    yMax: float
 
 
 @app.exception_handler(Exception)
@@ -123,6 +135,117 @@ def _compose_live_track_id(camera_id: int | None, track_id: int) -> int:
     return camera_component * 1_000_000 + int(track_id)
 
 
+def _serialize_position_samples(samples: object) -> str:
+    if not isinstance(samples, list):
+        return "[]"
+    return json.dumps(samples, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_zone_record(raw_zone: object, index: int) -> dict[str, object] | None:
+    if not isinstance(raw_zone, dict):
+        return None
+
+    try:
+        x_min = int(float(raw_zone.get("xMin")))
+        x_max = int(float(raw_zone.get("xMax")))
+        y_min = int(float(raw_zone.get("yMin")))
+        y_max = int(float(raw_zone.get("yMax")))
+    except (TypeError, ValueError):
+        return None
+
+    zone_name = str(raw_zone.get("name", "") or "").strip() or f"Zone {index}"
+    zone_id = str(raw_zone.get("id", "") or "").strip() or f"zone_{index}"
+    return {
+        "id": zone_id,
+        "name": zone_name,
+        "xMin": min(x_min, x_max),
+        "xMax": max(x_min, x_max),
+        "yMin": min(y_min, y_max),
+        "yMax": max(y_min, y_max),
+    }
+
+
+def _save_floor_plan_map_zones(zones: list[dict[str, object]]) -> list[dict[str, object]]:
+    normalized = [
+        zone
+        for index, zone in enumerate(
+            (_normalize_zone_record(raw_zone, index) for index, raw_zone in enumerate(zones, start=1)),
+            start=1,
+        )
+        if zone is not None
+    ]
+    floor_plan_state_collection.update_one(
+        {"_id": "current"},
+        {"$set": {"zones": normalized, "updated_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return normalized
+
+
+def _load_floor_plan_map_zones() -> list[dict[str, object]]:
+    document = floor_plan_state_collection.find_one({"_id": "current"}, {"_id": 0, "zones": 1}) or {}
+    stored_zones = document.get("zones")
+    if not isinstance(stored_zones, list):
+        return []
+
+    return [
+        zone
+        for index, zone in enumerate(
+            (_normalize_zone_record(raw_zone, index) for index, raw_zone in enumerate(stored_zones, start=1)),
+            start=1,
+        )
+        if zone is not None
+    ]
+
+
+def _resolve_zone_name(x: int | float | None, y: int | float | None, zones: list[dict[str, object]]) -> str:
+    if x is None or y is None:
+        return ""
+
+    for zone in zones:
+        try:
+            if (
+                float(zone["xMin"]) <= float(x) <= float(zone["xMax"])
+                and float(zone["yMin"]) <= float(y) <= float(zone["yMax"])
+            ):
+                return str(zone.get("name", "") or "")
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ""
+
+
+def _append_position_sample(
+    track_time: dict[str, object],
+    *,
+    sample_time: datetime,
+    x: int,
+    y: int,
+    zone_name: str,
+    interval_sec: float = POSITION_SAMPLE_INTERVAL_SEC,
+) -> None:
+    last_sample_time = track_time.get("_last_position_sample_time")
+    if isinstance(last_sample_time, datetime):
+        elapsed_sec = (sample_time - last_sample_time).total_seconds()
+        if elapsed_sec < interval_sec:
+            return
+
+    samples = track_time.setdefault("position_samples", [])
+    if not isinstance(samples, list):
+        samples = []
+        track_time["position_samples"] = samples
+
+    samples.append(
+        {
+            "timestamp": sample_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "x": int(x),
+            "y": int(y),
+            "zone_name": zone_name,
+        }
+    )
+    track_time["_last_position_sample_time"] = sample_time
+    track_time["zone_name"] = zone_name or str(track_time.get("zone_name", "") or "")
+
+
 def _write_live_people_times_csv(output_path: Path, track_times: dict[int, dict[str, object]]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as f:
@@ -139,6 +262,8 @@ def _write_live_people_times_csv(output_path: Path, track_times: dict[int, dict[
             "Max_area",
             "Snapshots_saved",
             "Is_Staff",
+            "Zone_Name",
+            "Position_Samples",
         ])
         for track_id, row in sorted(track_times.items(), key=lambda item: item[0]):
             enter_time = row.get("enter")
@@ -159,6 +284,8 @@ def _write_live_people_times_csv(output_path: Path, track_times: dict[int, dict[
                 row.get("max_area", ""),
                 row.get("snapshots_saved", 0),
                 bool(row.get("is_staff", False)),
+                str(row.get("zone_name", "") or ""),
+                _serialize_position_samples(row.get("position_samples", [])),
             ])
 
 
@@ -259,6 +386,42 @@ def _build_stats_group(rows: list[dict], age_order: list[str]) -> dict:
         "average_duration_sec": (total_duration_sec / total_customers) if total_customers > 0 else 0,
         "peak_hour": f"{peak_hour_key}:00" if peak_hour_key.isdigit() and len(peak_hour_key) == 2 else "Unknown",
     }
+
+
+def _parse_sample_timestamp(raw_value: object) -> datetime | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+
+def _matches_stats_filters(
+    dt_value: datetime | None,
+    *,
+    filter_date,
+    range_start_date,
+    start_time_value,
+    end_time_value,
+) -> bool:
+    if dt_value is None:
+        return False
+
+    if filter_date is not None and dt_value.date() != filter_date:
+        return False
+    if range_start_date is not None and dt_value.date() < range_start_date:
+        return False
+    if start_time_value is not None and end_time_value is not None:
+        record_time = dt_value.time()
+        if record_time < start_time_value or record_time > end_time_value:
+            return False
+    return True
 
 
 def _build_buffered_zone(
@@ -800,6 +963,8 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
     model = YOLO("yolov8s.pt")
     processed_customer_ids = set()
     track_zone_stats = {}
+    analytics_zones = _load_floor_plan_map_zones()
+    last_zone_refresh_monotonic = time.monotonic()
     homography_status_logged = False
     logger.info("Opening video source: %s", video_path)
     capture = cv2.VideoCapture(os.fspath(video_path))
@@ -830,6 +995,10 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
             annotated_frame = r.orig_img.copy()
             projected_points: list[dict[str, object]] = []
             try:
+                now_monotonic = time.monotonic()
+                if now_monotonic - last_zone_refresh_monotonic >= 2.0:
+                    analytics_zones = _load_floor_plan_map_zones()
+                    last_zone_refresh_monotonic = now_monotonic
                 current_time = datetime.now()
                 height, width = annotated_frame.shape[:2]
                 raw_zone = _load_zone_for_filename(filename)
@@ -932,6 +1101,8 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
                                         "max_area": 0,
                                         "snapshots_saved": 0,
                                         "is_staff": False,
+                                        "zone_name": "",
+                                        "position_samples": [],
                                     },
                                 )
                                 track_time["exit"] = current_time
@@ -975,7 +1146,35 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
                                 )
 
                         if map_x is not None and map_y is not None:
-                            projected_points.append({"x": map_x, "y": map_y, "is_staff": bool(is_staff)})
+                            zone_name = _resolve_zone_name(map_x, map_y, analytics_zones)
+                            projected_points.append(
+                                {"x": map_x, "y": map_y, "is_staff": bool(is_staff), "zone_name": zone_name}
+                            )
+                            if live_track_id is not None:
+                                with live_session_lock:
+                                    track_time = live_session_track_times.setdefault(
+                                        live_track_id,
+                                        {
+                                            "enter": current_time,
+                                            "exit": current_time,
+                                            "frames_seen": 0,
+                                            "max_conf": None,
+                                            "first_bbox": [x1, y1, x2, y2],
+                                            "last_bbox": [x1, y1, x2, y2],
+                                            "max_area": 0,
+                                            "snapshots_saved": 0,
+                                            "is_staff": False,
+                                            "zone_name": "",
+                                            "position_samples": [],
+                                        },
+                                    )
+                                    _append_position_sample(
+                                        track_time,
+                                        sample_time=current_time,
+                                        x=map_x,
+                                        y=map_y,
+                                        zone_name=zone_name,
+                                    )
 
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), bg_color, 2)
 
@@ -1003,6 +1202,8 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
                                                         "max_area": max(0, (x2 - x1) * (y2 - y1)),
                                                         "snapshots_saved": 0,
                                                         "is_staff": False,
+                                                        "zone_name": "",
+                                                        "position_samples": [],
                                                     },
                                                 )
                                                 track_time["snapshots_saved"] = 1
@@ -1051,7 +1252,19 @@ async def upload_floor_plan(file: UploadFile = File(...)):
     with FLOOR_PLAN_PATH.open("wb") as buffer:
         buffer.write(await file.read())
     await file.close()
+    _save_floor_plan_map_zones([])
     return {"status": "uploaded"}
+
+
+@app.get("/api/floor_plan/zones")
+async def get_floor_plan_zones():
+    return {"zones": _load_floor_plan_map_zones()}
+
+
+@app.post("/api/floor_plan/zones")
+async def save_floor_plan_zones(payload: list[FloorPlanZone]):
+    saved_zones = _save_floor_plan_map_zones([zone.model_dump() for zone in payload])
+    return {"status": "success", "zones": saved_zones}
 
 
 @app.post("/api/analyze_floor_plan")
@@ -1155,7 +1368,12 @@ async def end_session(background_tasks: BackgroundTasks):
 
 
 @app.get("/api/stats")
-async def get_stats():
+async def get_stats(
+    request: Request,
+    tab: Optional[str] = None,
+    date: Optional[str] = None,
+    time: Optional[str] = None,
+):
     age_order = ["0-17", "18-25", "26-35", "36-45", "46-55", "56+", "Unknown"]
     empty_group = {
         "total_customers": 0,
@@ -1164,18 +1382,64 @@ async def get_stats():
         "average_duration_sec": 0,
         "peak_hour": "Unknown",
     }
+    floor_plan_url = (
+        f"{str(request.base_url).rstrip('/')}/floor_plan"
+        if FLOOR_PLAN_PATH.exists()
+        else None
+    )
 
     try:
         sessions = list(sessions_collection.find({}, {"_id": 0, "session_id": 1, "faces": 1}))
     except Exception as exc:
         logger.warning("Could not load analytics stats: %s", exc)
-        return {"overall": empty_group, "by_date": {}}
+        return {
+            "overall": empty_group,
+            "by_date": {},
+            "zone_stats": [],
+            "heatmap_points": [],
+            "floor_plan_url": floor_plan_url,
+        }
 
     if not sessions:
-        return {"overall": empty_group, "by_date": {}}
+        return {
+            "overall": empty_group,
+            "by_date": {},
+            "zone_stats": [],
+            "heatmap_points": [],
+            "floor_plan_url": floor_plan_url,
+        }
 
     overall_rows: list[dict] = []
     rows_by_date: dict[str, list[dict]] = {}
+    heatmap_points: list[dict[str, object]] = []
+    zone_person_samples: dict[str, dict[str, int]] = {}
+    total_zone_samples = 0
+    today_date = datetime.now().date()
+    filter_date: Optional[datetime.date] = None
+    range_start_date: Optional[datetime.date] = None
+    start_time_value = None
+    end_time_value = None
+
+    if date:
+        try:
+            filter_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            filter_date = None
+    elif tab == "today":
+        filter_date = today_date
+    elif tab == "7days":
+        range_start_date = today_date - timedelta(days=7)
+    elif tab == "30days":
+        range_start_date = today_date - timedelta(days=30)
+
+    if time and "-" in time:
+        try:
+            raw_start_time, raw_end_time = [part.strip() for part in time.split("-", 1)]
+            start_time_value = datetime.strptime(raw_start_time, "%H:%M").time()
+            end_time_value = datetime.strptime(raw_end_time, "%H:%M").time()
+        except ValueError:
+            start_time_value = None
+            end_time_value = None
 
     for session in sessions:
         faces = session.get("faces", [])
@@ -1191,8 +1455,19 @@ async def get_stats():
                 continue
 
             enter_time = str(additional_metadata.get("enter_time", "") or "").strip()
+            enter_dt = _parse_sample_timestamp(enter_time)
+            if not _matches_stats_filters(
+                enter_dt,
+                filter_date=filter_date,
+                range_start_date=range_start_date,
+                start_time_value=start_time_value,
+                end_time_value=end_time_value,
+            ):
+                continue
+
             date_key = enter_time[:10] if len(enter_time) >= 10 else "Unknown Date"
             hour_str = enter_time[11:13] if len(enter_time) >= 13 else "Unknown"
+            person_key = str(face.get("person_key") or face.get("face_id") or "")
 
             face_row = {
                 "age": face.get("classification_result", {}).get("age"),
@@ -1203,8 +1478,62 @@ async def get_stats():
             overall_rows.append(face_row)
             rows_by_date.setdefault(date_key, []).append(face_row)
 
+            raw_samples = additional_metadata.get("position_samples", [])
+            samples = raw_samples if isinstance(raw_samples, list) else []
+            for sample in samples:
+                if not isinstance(sample, dict):
+                    continue
+
+                sample_dt = _parse_sample_timestamp(sample.get("timestamp"))
+                if not _matches_stats_filters(
+                    sample_dt,
+                    filter_date=filter_date,
+                    range_start_date=range_start_date,
+                    start_time_value=start_time_value,
+                    end_time_value=end_time_value,
+                ):
+                    continue
+
+                try:
+                    sample_x = int(round(float(sample.get("x"))))
+                    sample_y = int(round(float(sample.get("y"))))
+                except (TypeError, ValueError):
+                    continue
+
+                heatmap_points.append({"x": sample_x, "y": sample_y, "weight": 1})
+
+                sample_zone_name = str(sample.get("zone_name", "") or "").strip()
+                if not sample_zone_name:
+                    continue
+
+                zone_counts = zone_person_samples.setdefault(sample_zone_name, {})
+                zone_counts[person_key] = zone_counts.get(person_key, 0) + 1
+                total_zone_samples += 1
+
+    zone_stats = []
+    for zone_name, person_counts in sorted(
+        zone_person_samples.items(),
+        key=lambda item: sum(item[1].values()),
+        reverse=True,
+    ):
+        total_samples = sum(person_counts.values())
+        visitors_in_zone = max(1, len(person_counts))
+        zone_stats.append(
+            {
+                "name": zone_name,
+                "avg_time_sec": round((total_samples * POSITION_SAMPLE_INTERVAL_SEC) / visitors_in_zone),
+                "percent": round((total_samples / total_zone_samples) * 100) if total_zone_samples > 0 else 0,
+            }
+        )
+
     if not overall_rows:
-        return {"overall": empty_group, "by_date": {}}
+        return {
+            "overall": empty_group,
+            "by_date": {},
+            "zone_stats": zone_stats,
+            "heatmap_points": heatmap_points,
+            "floor_plan_url": floor_plan_url,
+        }
 
     return {
         "overall": _build_stats_group(overall_rows, age_order),
@@ -1212,6 +1541,9 @@ async def get_stats():
             date_key: _build_stats_group(date_rows, age_order)
             for date_key, date_rows in sorted(rows_by_date.items(), key=lambda item: item[0], reverse=True)
         },
+        "zone_stats": zone_stats,
+        "heatmap_points": heatmap_points,
+        "floor_plan_url": floor_plan_url,
     }
 
 

@@ -42,10 +42,13 @@ class MongoMetadataManager:
         canonical_person_key: str,
         duplicate_track_id: int | None,
         duration_sec: float,
+        zone_name: str = "",
+        position_samples: list[dict] | None = None,
     ):
         """Merge duplicate track time into canonical person entry."""
         canonical_person_key = str(canonical_person_key)
         duration_sec = float(duration_sec or 0.0)
+        position_samples = position_samples or []
 
         session = self.get_session(session_id)
         if not session:
@@ -69,12 +72,29 @@ class MongoMetadataManager:
         if duplicate_track_id is not None and duplicate_track_id not in track_ids:
             track_ids.append(duplicate_track_id)
 
+        existing_additional = target.get("additional_metadata") or {}
+        merged_samples = existing_additional.get("position_samples") or []
+        merged_samples.extend(sample for sample in position_samples if isinstance(sample, dict))
+        merged_samples.sort(key=lambda sample: str(sample.get("timestamp", "") or ""))
+
+        merged_zone_name = str(zone_name or existing_additional.get("zone_name") or "")
+        if not merged_zone_name and merged_samples:
+            zone_counts: dict[str, int] = {}
+            for sample in merged_samples:
+                sample_zone = str(sample.get("zone_name", "") or "").strip()
+                if sample_zone:
+                    zone_counts[sample_zone] = zone_counts.get(sample_zone, 0) + 1
+            if zone_counts:
+                merged_zone_name = max(zone_counts.items(), key=lambda item: item[1])[0]
+
         self.sessions.update_one(
             {"session_id": session_id},
             {
                 "$set": {
                     f"faces.{target_idx}.total_duration_sec": new_total,
                     f"faces.{target_idx}.track_ids": track_ids,
+                    f"faces.{target_idx}.additional_metadata.zone_name": merged_zone_name,
+                    f"faces.{target_idx}.additional_metadata.position_samples": merged_samples,
                 }
             },
         )
