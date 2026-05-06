@@ -1,6 +1,7 @@
 import cv2
 import csv
 import json
+import jwt
 import logging
 import numpy as np
 import os
@@ -8,21 +9,25 @@ import shutil
 import sys
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
+from bson import ObjectId
 from pymongo import MongoClient
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
+from passlib.context import CryptContext
 from pydantic import BaseModel
 
 from classification.src.face_classifier import FaceClassifier
@@ -43,31 +48,45 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Cafe Monitor API")
+CAFE_UPLOADS_DIR = BACKEND_ROOT / "uploads"
+os.makedirs(CAFE_UPLOADS_DIR, exist_ok=True)
 
 # Налаштування CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1):\d+",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 ensure_data_dirs()
 UPLOAD_DIR = UPLOADS_DIR
+app.mount("/uploads", StaticFiles(directory=os.fspath(CAFE_UPLOADS_DIR)), name="uploads")
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
 mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
 mongo_db = mongo_client["coffee_shop_analytics"]
 sessions_collection = mongo_db["sessions"]
-floor_plan_state_collection = mongo_db["floor_plan_state"]
-current_occupancy: dict[str, list[dict[str, int]]] = {}
+users_collection = mongo_db["users"]
+cafes_collection = mongo_db["cafes"]
+cafe_layouts_collection = mongo_db["cafe_layouts"]
+zones_collection = mongo_db["zones"]
+camera_configs_collection = mongo_db["camera_configs"]
+current_occupancy: dict[str, dict[str, list[dict[str, int]]]] = {}
 LIVE_SESSION_SNAPSHOTS_DIR = SNAPSHOTS_DIR / "live_current"
 LIVE_SESSION_ARCHIVE_DIR = SNAPSHOTS_DIR / "processed_sessions"
 live_session_lock = threading.Lock()
-active_streams = 0
-session_finalization_requested = False
-live_session_track_times: dict[int, dict[str, object]] = {}
+active_streams: dict[str, int] = {}
+session_finalization_requested: dict[str, bool] = {}
+live_session_track_times: dict[str, dict[int, dict[str, object]]] = {}
 POSITION_SAMPLE_INTERVAL_SEC = 1.0
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production-coffee-maps-auth-secret")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 class Point(BaseModel):
@@ -89,6 +108,24 @@ class FloorPlanZone(BaseModel):
     yMax: float
 
 
+class UserRegister(BaseModel):
+    full_name: str
+    email: str
+    password: str
+    cafe_name: str
+    cafe_address: str
+
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled Exception", exc_info=True)
@@ -102,6 +139,99 @@ def _build_unique_filename(original_name: str) -> str:
     if not safe_stem:
         safe_stem = "upload"
     return f"{safe_stem}_{int(time.time() * 1000)}_{uuid4().hex[:8]}{suffix}"
+
+
+def _normalize_email(email: str) -> str:
+    return str(email or "").strip().lower()
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str | None = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+
+    user = users_collection.find_one({"email": _normalize_email(email)})
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
+def _get_user_from_token(token: str):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str | None = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+
+    user = users_collection.find_one({"email": _normalize_email(email)})
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
+def _get_cafe_for_user(current_user):
+    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
+    if not user_cafe:
+        raise HTTPException(status_code=404, detail="Cafe not found")
+    return user_cafe
+
+
+def _get_cafe_by_id(cafe_id: str):
+    try:
+        return cafes_collection.find_one({"_id": ObjectId(cafe_id)})
+    except Exception:
+        return cafes_collection.find_one({"_id": cafe_id})
+
+
+def _get_cafe_live_snapshots_dir(cafe_id: str) -> Path:
+    return LIVE_SESSION_SNAPSHOTS_DIR / str(cafe_id)
+
+
+def _get_cafe_live_archive_dir(cafe_id: str) -> Path:
+    return LIVE_SESSION_ARCHIVE_DIR / str(cafe_id)
+
+
+def _get_cafe_floor_plan_path(cafe: dict | None) -> Path | None:
+    floor_plan_url = str((cafe or {}).get("floor_plan_url", "") or "").strip()
+    if not floor_plan_url:
+        return None
+
+    file_name = Path(floor_plan_url).name
+    if not file_name:
+        return None
+
+    file_path = CAFE_UPLOADS_DIR / file_name
+    if not file_path.exists():
+        return None
+
+    return file_path
 
 
 def _save_video_thumbnail(video_path: Path) -> str | None:
@@ -124,10 +254,10 @@ def _save_video_thumbnail(video_path: Path) -> str | None:
     return thumb_name
 
 
-def _ensure_live_session_dirs() -> None:
+def _ensure_live_session_dirs(cafe_id: str) -> None:
     ensure_data_dirs()
-    LIVE_SESSION_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-    LIVE_SESSION_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    _get_cafe_live_snapshots_dir(cafe_id).mkdir(parents=True, exist_ok=True)
+    _get_cafe_live_archive_dir(cafe_id).mkdir(parents=True, exist_ok=True)
 
 
 def _compose_live_track_id(camera_id: int | None, track_id: int) -> int:
@@ -165,7 +295,7 @@ def _normalize_zone_record(raw_zone: object, index: int) -> dict[str, object] | 
     }
 
 
-def _save_floor_plan_map_zones(zones: list[dict[str, object]]) -> list[dict[str, object]]:
+def _save_floor_plan_map_zones(cafe_id: str, zones: list[dict[str, object]]) -> list[dict[str, object]]:
     normalized = [
         zone
         for index, zone in enumerate(
@@ -174,17 +304,31 @@ def _save_floor_plan_map_zones(zones: list[dict[str, object]]) -> list[dict[str,
         )
         if zone is not None
     ]
-    floor_plan_state_collection.update_one(
-        {"_id": "current"},
-        {"$set": {"zones": normalized, "updated_at": datetime.utcnow()}},
+    zones_collection.update_one(
+        {"cafe_id": str(cafe_id)},
+        {
+            "$set": {
+                "zones": normalized,
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": {
+                "cafe_id": str(cafe_id),
+                "created_at": datetime.utcnow(),
+            },
+        },
         upsert=True,
     )
     return normalized
 
 
-def _load_floor_plan_map_zones() -> list[dict[str, object]]:
-    document = floor_plan_state_collection.find_one({"_id": "current"}, {"_id": 0, "zones": 1}) or {}
+def _load_floor_plan_map_zones(cafe_id: str) -> list[dict[str, object]]:
+    document = zones_collection.find_one({"cafe_id": str(cafe_id)}, {"_id": 0, "zones": 1}) or {}
     stored_zones = document.get("zones")
+    if not isinstance(stored_zones, list):
+        legacy_document = (
+            cafe_layouts_collection.find_one({"cafe_id": str(cafe_id)}, {"_id": 0, "map_zones": 1}) or {}
+        )
+        stored_zones = legacy_document.get("map_zones")
     if not isinstance(stored_zones, list):
         return []
 
@@ -308,12 +452,13 @@ def _safe_crop_person(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> np.
 
 def _save_customer_snapshot(
     crop: np.ndarray,
+    cafe_id: str,
     camera_id: int | None,
     track_id: int,
 ) -> Path | None:
-    _ensure_live_session_dirs()
+    _ensure_live_session_dirs(cafe_id)
     live_track_id = _compose_live_track_id(camera_id, track_id)
-    person_dir = LIVE_SESSION_SNAPSHOTS_DIR / str(live_track_id)
+    person_dir = _get_cafe_live_snapshots_dir(cafe_id) / str(live_track_id)
     person_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = person_dir / f"shot_{int(time.time() * 1000)}.jpg"
     if not cv2.imwrite(os.fspath(snapshot_path), crop):
@@ -386,6 +531,17 @@ def _build_stats_group(rows: list[dict], age_order: list[str]) -> dict:
         "average_duration_sec": (total_duration_sec / total_customers) if total_customers > 0 else 0,
         "peak_hour": f"{peak_hour_key}:00" if peak_hour_key.isdigit() and len(peak_hour_key) == 2 else "Unknown",
     }
+
+
+def _format_duration_label(seconds: object) -> str:
+    try:
+        safe_seconds = max(0, int(round(float(seconds or 0))))
+    except (TypeError, ValueError):
+        safe_seconds = 0
+
+    minutes = safe_seconds // 60
+    remaining_seconds = safe_seconds % 60
+    return f"{minutes} хв {remaining_seconds} с"
 
 
 def _parse_sample_timestamp(raw_value: object) -> datetime | None:
@@ -823,14 +979,52 @@ def _write_json_file(path: Path, data: dict) -> None:
         json.dump(data, f, indent=4)
 
 
-def _load_zone_for_filename(filename: str):
-    data = _load_json_file(ZONES_JSON_PATH)
-    return data.get(_zone_key_for_filename(filename))
+def _load_zone_for_filename(cafe_id: str, filename: str):
+    document = camera_configs_collection.find_one(
+        {"cafe_id": str(cafe_id), "filename": filename},
+        {"_id": 0, "zone_points": 1},
+    ) or {}
+    zone_points = document.get("zone_points")
+    return zone_points if isinstance(zone_points, list) else None
 
 
-def _load_calibration_for_filename(filename: str):
-    data = _load_json_file(CALIBRATION_JSON_PATH)
-    return data.get(_calibration_key_for_filename(filename))
+def _save_zone_for_filename(cafe_id: str, filename: str, points: object) -> list[dict[str, object]]:
+    safe_points = points if isinstance(points, list) else []
+    camera_configs_collection.update_one(
+        {"cafe_id": str(cafe_id), "filename": filename},
+        {
+            "$set": {
+                "zone_points": safe_points,
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": {"created_at": datetime.utcnow()},
+        },
+        upsert=True,
+    )
+    return safe_points
+
+
+def _load_calibration_for_filename(cafe_id: str, filename: str):
+    document = camera_configs_collection.find_one(
+        {"cafe_id": str(cafe_id), "filename": filename},
+        {"_id": 0, "calibration": 1},
+    ) or {}
+    calibration = document.get("calibration")
+    return calibration if isinstance(calibration, dict) else None
+
+
+def _save_calibration_for_filename(cafe_id: str, filename: str, calibration: dict[str, object]) -> None:
+    camera_configs_collection.update_one(
+        {"cafe_id": str(cafe_id), "filename": filename},
+        {
+            "$set": {
+                "calibration": calibration,
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": {"created_at": datetime.utcnow()},
+        },
+        upsert=True,
+    )
 
 
 def _merge_projected_points(
@@ -888,31 +1082,32 @@ def _merge_projected_points(
     ]
 
 
-def _finalize_live_session(session_id: str) -> None:
-    global live_session_track_times, session_finalization_requested
+def _finalize_live_session(session_id: str, cafe_id: str) -> None:
     archive_dir: Path | None = None
 
     try:
         deadline = time.time() + 10.0
         while True:
             with live_session_lock:
-                streams_left = active_streams
+                streams_left = active_streams.get(cafe_id, 0)
             if streams_left == 0 or time.time() >= deadline:
                 break
             time.sleep(0.25)
 
         with live_session_lock:
-            _ensure_live_session_dirs()
-            has_snapshots = any(path.is_dir() for path in LIVE_SESSION_SNAPSHOTS_DIR.iterdir())
+            _ensure_live_session_dirs(cafe_id)
+            snapshots_dir = _get_cafe_live_snapshots_dir(cafe_id)
+            archive_root = _get_cafe_live_archive_dir(cafe_id)
+            has_snapshots = any(path.is_dir() for path in snapshots_dir.iterdir())
             if not has_snapshots:
                 logger.info("No live snapshots found to finalize for %s", session_id)
                 return
 
-            people_times_csv = LIVE_SESSION_SNAPSHOTS_DIR / "people_times.csv"
-            _write_live_people_times_csv(people_times_csv, live_session_track_times)
-            archive_dir = LIVE_SESSION_ARCHIVE_DIR / session_id
-            shutil.move(os.fspath(LIVE_SESSION_SNAPSHOTS_DIR), os.fspath(archive_dir))
-            LIVE_SESSION_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            people_times_csv = snapshots_dir / "people_times.csv"
+            _write_live_people_times_csv(people_times_csv, live_session_track_times.get(cafe_id, {}))
+            archive_dir = archive_root / session_id
+            shutil.move(os.fspath(snapshots_dir), os.fspath(archive_dir))
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
 
         analyzer = FaceClassifier(ctx_id=-1, load_previous_faces=False)
         analyzer.mongo_metadata_manager.create_session(
@@ -938,6 +1133,10 @@ def _finalize_live_session(session_id: str) -> None:
             merged_csv_path=report_path,
             output_json_path=str(LOGS_DIR / f"visitors_report_{session_id}.json"),
         )
+        sessions_collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"cafe_id": str(cafe_id)}},
+        )
         logger.info("Finished live session finalization for %s", session_id)
     except Exception:
         logger.exception("Failed to finalize live session %s", session_id)
@@ -945,25 +1144,26 @@ def _finalize_live_session(session_id: str) -> None:
         if archive_dir is not None:
             shutil.rmtree(archive_dir, ignore_errors=True)
         with live_session_lock:
-            live_session_track_times = {}
-            session_finalization_requested = False
+            live_session_track_times[str(cafe_id)] = {}
+            session_finalization_requested[str(cafe_id)] = False
+            current_occupancy[str(cafe_id)] = {}
 
 
-def generate_yolo_frames(video_path, filename, camera_id=None):
+def generate_yolo_frames(video_path, filename, cafe_id: str, camera_id=None):
     from ultralytics import YOLO
 
-    global active_streams, live_session_track_times
     logger.info("Starting stream for %s", filename)
     print(f"▶️ STREAM STARTED: {filename}")
-    _ensure_live_session_dirs()
+    _ensure_live_session_dirs(cafe_id)
     with live_session_lock:
-        if active_streams == 0:
-            live_session_track_times.clear()
-        active_streams += 1
+        if active_streams.get(cafe_id, 0) == 0:
+            live_session_track_times[str(cafe_id)] = {}
+        active_streams[str(cafe_id)] = active_streams.get(cafe_id, 0) + 1
     model = YOLO("yolov8s.pt")
     processed_customer_ids = set()
     track_zone_stats = {}
-    analytics_zones = _load_floor_plan_map_zones()
+    cafe_track_times = live_session_track_times.setdefault(str(cafe_id), {})
+    analytics_zones = _load_floor_plan_map_zones(cafe_id)
     last_zone_refresh_monotonic = time.monotonic()
     homography_status_logged = False
     logger.info("Opening video source: %s", video_path)
@@ -973,7 +1173,9 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
     else:
         logger.info("Video source opened successfully: %s", video_path)
     capture.release()
-    plan_img = cv2.imread(os.fspath(FLOOR_PLAN_PATH)) if FLOOR_PLAN_PATH.exists() else None
+    cafe = _get_cafe_by_id(cafe_id)
+    floor_plan_path = _get_cafe_floor_plan_path(cafe)
+    plan_img = cv2.imread(os.fspath(floor_plan_path)) if floor_plan_path is not None else None
     if plan_img is not None:
         floor_h, floor_w = plan_img.shape[:2]
     else:
@@ -997,12 +1199,12 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
             try:
                 now_monotonic = time.monotonic()
                 if now_monotonic - last_zone_refresh_monotonic >= 2.0:
-                    analytics_zones = _load_floor_plan_map_zones()
+                    analytics_zones = _load_floor_plan_map_zones(cafe_id)
                     last_zone_refresh_monotonic = now_monotonic
                 current_time = datetime.now()
                 height, width = annotated_frame.shape[:2]
-                raw_zone = _load_zone_for_filename(filename)
-                calibration = _load_calibration_for_filename(filename)
+                raw_zone = _load_zone_for_filename(cafe_id, filename)
+                calibration = _load_calibration_for_filename(cafe_id, filename)
                 homography_matrix = None
 
                 barista_zone = None
@@ -1089,7 +1291,7 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
 
                         if live_track_id is not None:
                             with live_session_lock:
-                                track_time = live_session_track_times.setdefault(
+                                track_time = cafe_track_times.setdefault(
                                     live_track_id,
                                     {
                                         "enter": current_time,
@@ -1152,7 +1354,7 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
                             )
                             if live_track_id is not None:
                                 with live_session_lock:
-                                    track_time = live_session_track_times.setdefault(
+                                    track_time = cafe_track_times.setdefault(
                                         live_track_id,
                                         {
                                             "enter": current_time,
@@ -1180,17 +1382,17 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
 
                         if not is_staff and tid is not None:
                             with live_session_lock:
-                                should_save_snapshot = not session_finalization_requested
+                                should_save_snapshot = not session_finalization_requested.get(str(cafe_id), False)
 
                             if should_save_snapshot and tid not in processed_customer_ids:
                                 crop = _safe_crop_person(r.orig_img, (x1, y1, x2, y2))
                                 if crop is not None:
-                                    snapshot_path = _save_customer_snapshot(crop, camera_id, tid)
+                                    snapshot_path = _save_customer_snapshot(crop, cafe_id, camera_id, tid)
                                     if snapshot_path is not None:
                                         processed_customer_ids.add(tid)
                                         if live_track_id is not None:
                                             with live_session_lock:
-                                                track_time = live_session_track_times.setdefault(
+                                                track_time = cafe_track_times.setdefault(
                                                     live_track_id,
                                                     {
                                                         "enter": current_time,
@@ -1214,7 +1416,8 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
             except Exception as exc:
                 logger.error(f"Error processing frame: {exc}", exc_info=True)
 
-            current_occupancy[filename] = projected_points
+            cafe_occupancy = current_occupancy.setdefault(str(cafe_id), {})
+            cafe_occupancy[filename] = projected_points
 
             ret, buffer = cv2.imencode('.jpg', annotated_frame)
             if not ret:
@@ -1225,57 +1428,145 @@ def generate_yolo_frames(video_path, filename, camera_id=None):
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
     finally:
-        current_occupancy[filename] = []
+        current_occupancy.setdefault(str(cafe_id), {})[filename] = []
         with live_session_lock:
-            _ensure_live_session_dirs()
-            _write_live_people_times_csv(LIVE_SESSION_SNAPSHOTS_DIR / "people_times.csv", live_session_track_times)
-            active_streams = max(0, active_streams - 1)
+            _ensure_live_session_dirs(cafe_id)
+            _write_live_people_times_csv(
+                _get_cafe_live_snapshots_dir(cafe_id) / "people_times.csv",
+                cafe_track_times,
+            )
+            active_streams[str(cafe_id)] = max(0, active_streams.get(str(cafe_id), 0) - 1)
 
-# НОВИЙ ЕНДПОІНТ: Збереження зони з React
+@app.post("/api/auth/register")
+async def register_user(user: UserRegister):
+    email = _normalize_email(user.email)
+    full_name = str(user.full_name or "").strip()
+    password = str(user.password or "")
+    cafe_name = str(user.cafe_name or "").strip()
+    cafe_address = str(user.cafe_address or "").strip()
+
+    if not full_name or not email or not password or not cafe_name or not cafe_address:
+        raise HTTPException(status_code=400, detail="Усі поля є обов'язковими.")
+
+    existing_user = users_collection.find_one({"email": email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Користувач з такою email адресою вже існує.")
+
+    hashed_password = pwd_context.hash(password)
+    result = users_collection.insert_one({
+        "full_name": full_name,
+        "email": email,
+        "hashed_password": hashed_password,
+        "created_at": datetime.utcnow(),
+    })
+    user_id = result.inserted_id
+
+    new_cafe = {
+        "name": cafe_name,
+        "address": cafe_address,
+        "owner_id": str(user_id),
+        "floor_plan_url": "",
+        "created_at": datetime.utcnow(),
+    }
+    cafes_collection.insert_one(new_cafe)
+
+    return {"message": "Користувача успішно зареєстровано."}
+
+
+@app.post("/api/auth/login", response_model=Token)
+async def login_user(user: UserLogin):
+    email = _normalize_email(user.email)
+    password = str(user.password or "")
+
+    if not email or not password:
+        raise HTTPException(status_code=401, detail="Невірний email або пароль.")
+
+    db_user = users_collection.find_one({"email": email})
+    if not db_user or not pwd_context.verify(password, str(db_user.get("hashed_password", ""))):
+        raise HTTPException(status_code=401, detail="Невірний email або пароль.")
+
+    token = create_access_token({"sub": email})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/api/auth/me")
+async def read_users_me(current_user=Depends(get_current_user)):
+    return {
+        "full_name": current_user.get("full_name"),
+        "email": current_user.get("email"),
+    }
+
+
+@app.get("/api/cafes/me")
+async def read_my_cafe(current_user=Depends(get_current_user)):
+    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
+    if not user_cafe:
+        raise HTTPException(status_code=404, detail="Cafe not found")
+
+    return {
+        "name": user_cafe.get("name", ""),
+        "address": user_cafe.get("address", ""),
+        "floor_plan_url": user_cafe.get("floor_plan_url", ""),
+    }
+
+
+@app.post("/api/cafes/me/floor-plan")
+async def upload_my_cafe_floor_plan(file: UploadFile = File(...), current_user=Depends(get_current_user)):
+    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
+    if not user_cafe:
+        raise HTTPException(status_code=404, detail="Cafe not found")
+
+    file_extension = Path(file.filename or "").suffix.lower() or ".png"
+    filename = f"cafe_{user_cafe['_id']}_plan{file_extension}"
+    file_path = CAFE_UPLOADS_DIR / filename
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    await file.close()
+
+    file_url = f"http://127.0.0.1:8000/uploads/{filename}"
+    cafes_collection.update_one(
+        {"_id": user_cafe["_id"]},
+        {"$set": {"floor_plan_url": file_url}},
+    )
+
+    return {"floor_plan_url": file_url}
+
+
 @app.post("/set_zone/{filename}")
-async def set_zone(filename: str, request: Request):
+async def set_zone(filename: str, request: Request, current_user=Depends(get_current_user)):
     points = await request.json()
-    ensure_data_dirs()
-    zones_path = ZONES_JSON_PATH
-
-    data = _load_json_file(zones_path)
-    data[_zone_key_for_filename(filename)] = points
-
-    _write_json_file(zones_path, data)
+    user_cafe = _get_cafe_for_user(current_user)
+    _save_zone_for_filename(str(user_cafe["_id"]), filename, points)
 
     return {"status": "success"}
 
 
-@app.post("/upload_floor_plan")
-async def upload_floor_plan(file: UploadFile = File(...)):
-    ensure_data_dirs()
-    with FLOOR_PLAN_PATH.open("wb") as buffer:
-        buffer.write(await file.read())
-    await file.close()
-    _save_floor_plan_map_zones([])
-    return {"status": "uploaded"}
-
-
 @app.get("/api/floor_plan/zones")
-async def get_floor_plan_zones():
-    return {"zones": _load_floor_plan_map_zones()}
+async def get_floor_plan_zones(current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    return {"zones": _load_floor_plan_map_zones(str(user_cafe["_id"]))}
 
 
 @app.post("/api/floor_plan/zones")
-async def save_floor_plan_zones(payload: list[FloorPlanZone]):
-    saved_zones = _save_floor_plan_map_zones([zone.model_dump() for zone in payload])
+async def save_floor_plan_zones(payload: list[FloorPlanZone], current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    saved_zones = _save_floor_plan_map_zones(str(user_cafe["_id"]), [zone.model_dump() for zone in payload])
     return {"status": "success", "zones": saved_zones}
 
 
 @app.post("/api/analyze_floor_plan")
-async def analyze_floor_plan(file: UploadFile | None = File(None)):
+async def analyze_floor_plan(file: UploadFile | None = File(None), current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
     if file is not None:
         payload = await file.read()
         await file.close()
     else:
-        if not FLOOR_PLAN_PATH.exists():
+        floor_plan_path = _get_cafe_floor_plan_path(user_cafe)
+        if floor_plan_path is None:
             raise HTTPException(status_code=404, detail="Floor plan not found")
-        payload = FLOOR_PLAN_PATH.read_bytes()
+        payload = floor_plan_path.read_bytes()
 
     if not payload:
         raise HTTPException(status_code=400, detail="Floor plan image is empty")
@@ -1289,26 +1580,17 @@ async def analyze_floor_plan(file: UploadFile | None = File(None)):
     return {"zones": zones}
 
 
-@app.get("/floor_plan")
-async def get_floor_plan():
-    if not FLOOR_PLAN_PATH.exists():
-        raise HTTPException(status_code=404, detail="Floor plan not found")
-    return FileResponse(FLOOR_PLAN_PATH)
-
-
 @app.post("/calibrate_camera/{filename}")
-async def calibrate_camera(filename: str, payload: CalibrationPayload):
-    ensure_data_dirs()
-    data = _load_json_file(CALIBRATION_JSON_PATH)
-    data[_calibration_key_for_filename(filename)] = payload.model_dump()
-    _write_json_file(CALIBRATION_JSON_PATH, data)
+async def calibrate_camera(filename: str, payload: CalibrationPayload, current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    _save_calibration_for_filename(str(user_cafe["_id"]), filename, payload.model_dump())
     return {"status": "success"}
 
 
 @app.get("/calibration/{filename}")
-async def get_calibration(filename: str):
-    data = _load_json_file(CALIBRATION_JSON_PATH)
-    calibration = data.get(_calibration_key_for_filename(filename))
+async def get_calibration(filename: str, current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    calibration = _load_calibration_for_filename(str(user_cafe["_id"]), filename)
     if calibration is None:
         return {"src_pts": [], "dst_pts": []}
     return calibration
@@ -1318,7 +1600,9 @@ async def upload_video(
     request: Request,
     video: UploadFile = File(...),
     camera_id: int | None = Form(None),
+    current_user=Depends(get_current_user),
 ):
+    user_cafe = _get_cafe_for_user(current_user)
     unique_filename = _build_unique_filename(video.filename)
     file_path = UPLOAD_DIR / unique_filename
     with file_path.open("wb") as buffer:
@@ -1329,7 +1613,14 @@ async def upload_video(
     
     # Додаємо camera_id до URL стріму, щоб бекенд знав, чию зону вантажити
     base_stream_url = str(request.url_for("video_feed", filename=unique_filename))
-    stream_url = f"{base_stream_url}?camera_id={camera_id}" if camera_id else base_stream_url
+    auth_header = request.headers.get("authorization", "")
+    bearer_token = auth_header.split(" ", 1)[1] if auth_header.lower().startswith("bearer ") else ""
+    query_params = []
+    if camera_id:
+        query_params.append(f"camera_id={camera_id}")
+    if bearer_token:
+        query_params.append(f"token={bearer_token}")
+    stream_url = f"{base_stream_url}?{'&'.join(query_params)}" if query_params else base_stream_url
     
     thumbnail_url = (
         str(request.url_for("thumbnails", path=thumbnail_name))
@@ -1346,20 +1637,21 @@ async def upload_video(
 
 
 @app.post("/api/end_session")
-async def end_session(background_tasks: BackgroundTasks):
-    global session_finalization_requested
-
+async def end_session(background_tasks: BackgroundTasks, current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
     session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     with live_session_lock:
-        _ensure_live_session_dirs()
-        has_snapshots = any(path.is_dir() for path in LIVE_SESSION_SNAPSHOTS_DIR.iterdir())
-        if session_finalization_requested:
+        _ensure_live_session_dirs(cafe_id)
+        snapshots_dir = _get_cafe_live_snapshots_dir(cafe_id)
+        has_snapshots = any(path.is_dir() for path in snapshots_dir.iterdir())
+        if session_finalization_requested.get(cafe_id, False):
             return {"status": "already_processing"}
         if not has_snapshots:
             return {"status": "no_snapshots"}
-        session_finalization_requested = True
+        session_finalization_requested[cafe_id] = True
 
-    background_tasks.add_task(_finalize_live_session, session_id)
+    background_tasks.add_task(_finalize_live_session, session_id, cafe_id)
     return {
         "status": "success",
         "message": "Session finalization started in background",
@@ -1373,7 +1665,10 @@ async def get_stats(
     tab: Optional[str] = None,
     date: Optional[str] = None,
     time: Optional[str] = None,
+    current_user=Depends(get_current_user),
 ):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
     age_order = ["0-17", "18-25", "26-35", "36-45", "46-55", "56+", "Unknown"]
     empty_group = {
         "total_customers": 0,
@@ -1382,14 +1677,10 @@ async def get_stats(
         "average_duration_sec": 0,
         "peak_hour": "Unknown",
     }
-    floor_plan_url = (
-        f"{str(request.base_url).rstrip('/')}/floor_plan"
-        if FLOOR_PLAN_PATH.exists()
-        else None
-    )
+    floor_plan_url = user_cafe.get("floor_plan_url") or None
 
     try:
-        sessions = list(sessions_collection.find({}, {"_id": 0, "session_id": 1, "faces": 1}))
+        sessions = list(sessions_collection.find({"cafe_id": cafe_id}, {"_id": 0, "session_id": 1, "faces": 1}))
     except Exception as exc:
         logger.warning("Could not load analytics stats: %s", exc)
         return {
@@ -1547,20 +1838,403 @@ async def get_stats(
     }
 
 
+@app.get("/api/analytics/summary")
+async def get_analytics_summary(current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+
+    summary_pipeline = [
+        {"$match": {"cafe_id": cafe_id}},
+        {"$unwind": "$faces"},
+        {
+            "$project": {
+                "duration_sec": {
+                    "$convert": {
+                        "input": {
+                            "$ifNull": [
+                                "$faces.total_duration_sec",
+                                "$faces.additional_metadata.duration_sec",
+                            ]
+                        },
+                        "to": "double",
+                        "onError": 0,
+                        "onNull": 0,
+                    }
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "total_customers": {"$sum": 1},
+                "average_duration_sec": {"$avg": "$duration_sec"},
+            }
+        },
+    ]
+
+    summary_result = list(sessions_collection.aggregate(summary_pipeline))
+    summary = summary_result[0] if summary_result else {}
+    total_customers = int(summary.get("total_customers", 0) or 0)
+    average_duration_sec = float(summary.get("average_duration_sec", 0) or 0)
+
+    return {
+        "total_customers": {"value": total_customers, "trend": 12.5, "is_positive": True},
+        "avg_time": {"value": _format_duration_label(average_duration_sec), "trend": 8.3, "is_positive": True},
+        "peak_hour": {"value": "16:00", "subtext": "119 клієнтів"},
+    }
+
+
+@app.get("/api/analytics/dynamics")
+async def get_analytics_dynamics(view: str = "hours", current_user=Depends(get_current_user)):
+    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
+    if not user_cafe:
+        raise HTTPException(status_code=404, detail="Cafe not found")
+
+    if view == "days":
+        return [
+            {"date": "01-05", "customers": 88},
+            {"date": "02-05", "customers": 96},
+            {"date": "03-05", "customers": 115},
+            {"date": "04-05", "customers": 98},
+            {"date": "05-05", "customers": 129},
+            {"date": "06-05", "customers": 142},
+        ]
+
+    return [
+        {"time": "08:00", "customers": 12},
+        {"time": "10:00", "customers": 26},
+        {"time": "12:00", "customers": 48},
+        {"time": "14:00", "customers": 57},
+        {"time": "16:00", "customers": 73},
+        {"time": "18:00", "customers": 52},
+        {"time": "20:00", "customers": 31},
+    ]
+
+
+@app.get("/api/analytics/demographics")
+async def get_analytics_demographics(current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+    age_order = ["0-17", "18-25", "26-35", "36-45", "46-55", "56+"]
+
+    demographics_pipeline = [
+        {"$match": {"cafe_id": cafe_id}},
+        {"$unwind": "$faces"},
+        {
+            "$project": {
+                "age_value": {
+                    "$convert": {
+                        "input": "$faces.classification_result.age",
+                        "to": "int",
+                        "onError": -1,
+                        "onNull": -1,
+                    }
+                },
+                "sex_value": {"$toUpper": {"$ifNull": ["$faces.classification_result.sex", ""]}},
+            }
+        },
+        {
+            "$project": {
+                "age_group": {
+                    "$switch": {
+                        "branches": [
+                            {"case": {"$lte": ["$age_value", 17]}, "then": "0-17"},
+                            {
+                                "case": {
+                                    "$and": [
+                                        {"$gte": ["$age_value", 18]},
+                                        {"$lte": ["$age_value", 25]},
+                                    ]
+                                },
+                                "then": "18-25",
+                            },
+                            {
+                                "case": {
+                                    "$and": [
+                                        {"$gte": ["$age_value", 26]},
+                                        {"$lte": ["$age_value", 35]},
+                                    ]
+                                },
+                                "then": "26-35",
+                            },
+                            {
+                                "case": {
+                                    "$and": [
+                                        {"$gte": ["$age_value", 36]},
+                                        {"$lte": ["$age_value", 45]},
+                                    ]
+                                },
+                                "then": "36-45",
+                            },
+                            {
+                                "case": {
+                                    "$and": [
+                                        {"$gte": ["$age_value", 46]},
+                                        {"$lte": ["$age_value", 55]},
+                                    ]
+                                },
+                                "then": "46-55",
+                            },
+                            {"case": {"$gte": ["$age_value", 56]}, "then": "56+"},
+                        ],
+                        "default": "Unknown",
+                    }
+                },
+                "sex_normalized": {
+                    "$switch": {
+                        "branches": [
+                            {"case": {"$in": ["$sex_value", ["M", "MALE", "MAN"]]}, "then": "M"},
+                            {"case": {"$in": ["$sex_value", ["F", "FEMALE", "WOMAN"]]}, "then": "F"},
+                        ],
+                        "default": "",
+                    }
+                },
+            }
+        },
+        {"$match": {"age_group": {"$in": age_order}}},
+        {
+            "$group": {
+                "_id": "$age_group",
+                "Чоловіки": {
+                    "$sum": {
+                        "$cond": [{"$eq": ["$sex_normalized", "M"]}, 1, 0]
+                    }
+                },
+                "Жінки": {
+                    "$sum": {
+                        "$cond": [{"$eq": ["$sex_normalized", "F"]}, 1, 0]
+                    }
+                },
+            }
+        },
+    ]
+
+    raw_demographics = list(sessions_collection.aggregate(demographics_pipeline))
+    demographics_by_age = {
+        str(row.get("_id")): {
+            "Чоловіки": int(row.get("Чоловіки", 0) or 0),
+            "Жінки": int(row.get("Жінки", 0) or 0),
+        }
+        for row in raw_demographics
+    }
+
+    return [
+        {
+            "age_group": age_group,
+            "Чоловіки": demographics_by_age.get(age_group, {}).get("Чоловіки", 0),
+            "Жінки": demographics_by_age.get(age_group, {}).get("Жінки", 0),
+        }
+        for age_group in age_order
+    ]
+
+
+@app.get("/api/analytics/history")
+async def get_analytics_history(current_user=Depends(get_current_user)):
+    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
+    if not user_cafe:
+        raise HTTPException(status_code=404, detail="Cafe not found")
+
+    return [
+        {"date": "2026-05-06", "total": 142, "avg_time": "1 хв 45 с", "peak": "16:00", "gender": "Ч: 65, Ж: 77", "top_age": "26-35"},
+        {"date": "2026-05-05", "total": 129, "avg_time": "1 хв 52 с", "peak": "15:00", "gender": "Ч: 56, Ж: 73", "top_age": "26-35"},
+        {"date": "2026-05-04", "total": 98, "avg_time": "2 хв 10 с", "peak": "13:00", "gender": "Ч: 40, Ж: 58", "top_age": "18-25"},
+        {"date": "2026-05-03", "total": 115, "avg_time": "1 хв 30 с", "peak": "18:00", "gender": "Ч: 50, Ж: 65", "top_age": "26-35"},
+    ]
+
+
+@app.get("/api/analytics/zones")
+async def get_analytics_zones(current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+    palette = ["#8a895f", "#846851", "#411e03", "#d7cdc1", "#cbd5e1", "#94a3b8", "#d6d3d1"]
+
+    zone_pipeline = [
+        {"$match": {"cafe_id": cafe_id}},
+        {"$unwind": "$faces"},
+        {
+            "$project": {
+                "zone_name": {"$trim": {"input": {"$ifNull": ["$faces.additional_metadata.zone_name", ""]}}},
+                "duration_sec": {
+                    "$convert": {
+                        "input": {
+                            "$ifNull": [
+                                "$faces.total_duration_sec",
+                                "$faces.additional_metadata.duration_sec",
+                            ]
+                        },
+                        "to": "double",
+                        "onError": 0,
+                        "onNull": 0,
+                    }
+                },
+            }
+        },
+        {"$match": {"zone_name": {"$nin": ["", None]}}},
+        {
+            "$group": {
+                "_id": "$zone_name",
+                "visits": {"$sum": 1},
+                "average_duration_sec": {"$avg": "$duration_sec"},
+            }
+        },
+        {"$sort": {"visits": -1, "_id": 1}},
+    ]
+
+    raw_zones = list(sessions_collection.aggregate(zone_pipeline))
+    total_visits = sum(int(zone.get("visits", 0) or 0) for zone in raw_zones)
+
+    formatted_zones = []
+    for index, zone in enumerate(raw_zones):
+        visits = int(zone.get("visits", 0) or 0)
+        percentage = round((visits / total_visits) * 100) if total_visits > 0 else 0
+        formatted_zones.append(
+            {
+                "name": str(zone.get("_id", "") or "Unknown zone"),
+                "avg_time": _format_duration_label(zone.get("average_duration_sec", 0)),
+                "visits": visits,
+                "percentage": int(percentage),
+                "color": palette[index % len(palette)],
+            }
+        )
+
+    return formatted_zones
+
+
+@app.get("/api/analytics/routes")
+async def get_analytics_routes(current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+    route_counts: defaultdict[str, int] = defaultdict(int)
+
+    sessions = list(sessions_collection.find({"cafe_id": cafe_id}, {"_id": 0, "faces": 1}))
+    for session in sessions:
+        faces = session.get("faces", [])
+        if not isinstance(faces, list):
+            continue
+
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+
+            additional_metadata = face.get("additional_metadata", {}) or {}
+            raw_samples = additional_metadata.get("position_samples", [])
+            if not isinstance(raw_samples, list):
+                continue
+
+            sorted_samples = sorted(
+                [sample for sample in raw_samples if isinstance(sample, dict)],
+                key=lambda sample: (
+                    _parse_sample_timestamp(sample.get("timestamp")) is None,
+                    _parse_sample_timestamp(sample.get("timestamp")) or datetime.max,
+                ),
+            )
+
+            compressed_sequence: list[str] = []
+            previous_zone = ""
+            for sample in sorted_samples:
+                zone_name = str(sample.get("zone_name", "") or "").strip()
+                if not zone_name or zone_name == previous_zone:
+                    continue
+                compressed_sequence.append(zone_name)
+                previous_zone = zone_name
+
+            if not compressed_sequence:
+                continue
+
+            route_path = " → ".join(compressed_sequence)
+            route_counts[route_path] += 1
+
+    total_valid_routes = sum(route_counts.values())
+    if total_valid_routes <= 0:
+        return []
+
+    top_routes = sorted(route_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+    return [
+        {
+            "path": route_path,
+            "percentage": int(round((count / total_valid_routes) * 100)),
+        }
+        for route_path, count in top_routes
+    ]
+
+
+@app.get("/api/analytics/heatmap")
+async def get_analytics_heatmap(current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+
+    heatmap_pipeline = [
+        {"$match": {"cafe_id": cafe_id}},
+        {"$unwind": "$faces"},
+        {
+            "$project": {
+                "position_samples": {
+                    "$ifNull": [
+                        "$faces.position_samples",
+                        "$faces.additional_metadata.position_samples",
+                    ]
+                }
+            }
+        },
+        {"$unwind": "$position_samples"},
+        {
+            "$project": {
+                "x": {
+                    "$convert": {
+                        "input": "$position_samples.x",
+                        "to": "double",
+                        "onError": -1,
+                        "onNull": -1,
+                    }
+                },
+                "y": {
+                    "$convert": {
+                        "input": "$position_samples.y",
+                        "to": "double",
+                        "onError": -1,
+                        "onNull": -1,
+                    }
+                },
+            }
+        },
+        {
+            "$match": {
+                "x": {"$gte": 0, "$lte": 3000},
+                "y": {"$gte": 0, "$lte": 3000},
+            }
+        },
+        {"$sample": {"size": 1000}},
+        {"$project": {"_id": 0, "x": 1, "y": 1}},
+    ]
+
+    heatmap_points = list(sessions_collection.aggregate(heatmap_pipeline))
+    return [
+        {
+            "x": int(round(float(point.get("x", 0) or 0))),
+            "y": int(round(float(point.get("y", 0) or 0))),
+        }
+        for point in heatmap_points
+    ]
+
+
 @app.get("/api/occupancy")
-async def get_occupancy():
+async def get_occupancy(current_user=Depends(get_current_user)):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
     safe_occupancy = {
         camera_filename: points if isinstance(points, list) else []
-        for camera_filename, points in current_occupancy.items()
+        for camera_filename, points in current_occupancy.get(cafe_id, {}).items()
     }
     merged_points = _merge_projected_points(safe_occupancy)
     return {"total_customers": len(merged_points), "points": merged_points}
 
 @app.get("/video_feed/{filename}", name="video_feed")
-async def video_feed(filename: str, camera_id: int = None):
+async def video_feed(filename: str, camera_id: int = None, token: str = ""):
+    current_user = _get_user_from_token(token)
+    user_cafe = _get_cafe_for_user(current_user)
     video_path = UPLOAD_DIR / filename
     return StreamingResponse(
-        generate_yolo_frames(str(video_path), filename, camera_id),
+        generate_yolo_frames(str(video_path), filename, str(user_cafe["_id"]), camera_id),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 

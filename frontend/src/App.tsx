@@ -1,7 +1,10 @@
 import { Card, CardContent } from "./components/ui/card";
 import { Button } from "./components/ui/button";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, LogOut, User } from "lucide-react";
 import Analytics from "./pages/Analytics";
+import Login from "./pages/Login";
+import Register from "./pages/Register";
 
 type SessionStatus = "idle" | "running" | "finished";
 type ActiveTab = "live" | "analytics";
@@ -37,6 +40,12 @@ interface MapZone {
   yMax: number;
 }
 
+interface MyCafe {
+  name: string;
+  address?: string;
+  floor_plan_url: string;
+}
+
 const GENERIC_THUMBNAIL_URL =
   "data:image/svg+xml;utf8," +
   encodeURIComponent(`
@@ -56,8 +65,17 @@ const GENERIC_THUMBNAIL_URL =
   `);
 
 const API_ROOT = "http://localhost:8000";
-const FLOOR_PLAN_URL = `${API_ROOT}/floor_plan`;
 const CALIBRATION_POINT_COLORS = ["#22c55e", "#38bdf8", "#f59e0b", "#f43f5e"];
+
+const getAuthToken = () => localStorage.getItem("cafe_token") || "";
+
+const getAuthHeaders = (includeJson = false) => {
+  const token = getAuthToken();
+  return {
+    ...(includeJson ? { "Content-Type": "application/json" } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+};
 
 const normalizeMapZone = (zone: Partial<MapZone>, index: number): MapZone => {
   const xMin = Number(zone.xMin ?? 0);
@@ -76,7 +94,9 @@ const normalizeMapZone = (zone: Partial<MapZone>, index: number): MapZone => {
 };
 
 async function loadFloorPlanZones(): Promise<MapZone[]> {
-  const response = await fetch(`${API_ROOT}/api/floor_plan/zones`);
+  const response = await fetch(`${API_ROOT}/api/floor_plan/zones`, {
+    headers: getAuthHeaders(),
+  });
   const data = await response.json();
   if (!response.ok) {
     throw new Error(data.detail || "Не вдалося завантажити зони floor plan.");
@@ -90,7 +110,7 @@ async function loadFloorPlanZones(): Promise<MapZone[]> {
 async function saveFloorPlanZones(zones: MapZone[]): Promise<MapZone[]> {
   const response = await fetch(`${API_ROOT}/api/floor_plan/zones`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: getAuthHeaders(true),
     body: JSON.stringify(zones),
   });
   const data = await response.json();
@@ -107,8 +127,9 @@ async function uploadFloorPlanFile(file: File) {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch(`${API_ROOT}/upload_floor_plan`, {
+  const response = await fetch(`${API_ROOT}/api/cafes/me/floor-plan`, {
     method: "POST",
+    headers: getAuthHeaders(),
     body: formData,
   });
 
@@ -116,7 +137,8 @@ async function uploadFloorPlanFile(file: File) {
     throw new Error("Не вдалося завантажити floor plan.");
   }
 
-  return `${FLOOR_PLAN_URL}?t=${Date.now()}`;
+  const data = await response.json();
+  return data.floor_plan_url as string;
 }
 
 function CalibrationModal({
@@ -157,7 +179,9 @@ function CalibrationModal({
       }
 
       try {
-        const response = await fetch(`${API_ROOT}/calibration/${encodeURIComponent(cam.filename)}`);
+        const response = await fetch(`${API_ROOT}/calibration/${encodeURIComponent(cam.filename)}`, {
+          headers: getAuthHeaders(),
+        });
         const data = await response.json();
         if (!cancelled) {
           setSrcPts(Array.isArray(data.src_pts) ? data.src_pts.slice(0, 4) : []);
@@ -221,7 +245,7 @@ function CalibrationModal({
     try {
       const response = await fetch(`${API_ROOT}/calibrate_camera/${encodeURIComponent(cam.filename)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getAuthHeaders(true),
         body: JSON.stringify({ src_pts: srcPts, dst_pts: dstPts }),
       });
 
@@ -450,7 +474,7 @@ function CameraView({
     try {
       await fetch(`http://localhost:8000/set_zone/${encodeURIComponent(cam.filename)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getAuthHeaders(true),
         body: JSON.stringify(pointsToSave),
       });
     } catch (error) {
@@ -470,8 +494,8 @@ function CameraView({
       {showConfirm && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm">
           <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl">
-            <h3 className="mb-4 text-lg font-bold text-slate-900">Видалити камеру?</h3>
-            <p className="mb-6 text-sm text-slate-500">
+            <h3 className="mb-4 text-lg font-bold text-[#411e03]">Видалити камеру?</h3>
+            <p className="mb-6 text-sm text-[#846851]">
               Ви впевнені, що хочете видалити цей стрім? Це розірве з&apos;єднання для поточної сесії.
             </p>
             <div className="flex justify-end gap-3">
@@ -775,7 +799,9 @@ function LiveMonitorSidePanel({
 
     const loadOccupancy = async () => {
       try {
-        const response = await fetch(`${API_ROOT}/api/occupancy`);
+        const response = await fetch(`${API_ROOT}/api/occupancy`, {
+          headers: getAuthHeaders(),
+        });
         const data = await response.json();
         if (!cancelled) {
           const nextPoints = Array.isArray(data.points) ? data.points : [];
@@ -869,6 +895,7 @@ function LiveMonitorSidePanel({
     try {
       const response = await fetch(`${API_ROOT}/api/analyze_floor_plan`, {
         method: "POST",
+        headers: getAuthHeaders(),
       });
       const data = await response.json();
 
@@ -895,35 +922,35 @@ function LiveMonitorSidePanel({
         <Card className="rounded-2xl border-slate-200 bg-white shadow-sm">
           <CardContent className="p-4">
             <div className="mb-3 border-b pb-2">
-              <h2 className="text-base font-semibold text-slate-900">📊 Live Stats</h2>
-              <p className="mt-1 text-xs text-slate-500">Поточні дані з live occupancy та активної сесії.</p>
+              <h2 className="text-base font-semibold text-[#411e03]">📊 Live Stats</h2>
+              <p className="mt-1 text-xs text-[#846851]">Поточні дані з live occupancy та активної сесії.</p>
             </div>
             <div className="space-y-1.5 text-sm">
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Статус сесії</span>
-                <span className="font-semibold text-slate-900">
+                <span className="text-[#846851]">Статус сесії</span>
+                <span className="font-semibold text-[#411e03]">
                   {sessionStatus === "idle" ? "Очікує запуску" : sessionStatus}
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Активних стрімів</span>
-                <span className="font-bold text-slate-950">{sessionStatus === "running" ? camerasCount : 0}</span>
+                <span className="text-[#846851]">Активних стрімів</span>
+                <span className="font-bold text-[#411e03]">{sessionStatus === "running" ? camerasCount : 0}</span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Точок на карті</span>
-                <span className="font-bold text-slate-950">{occupancy.length}</span>
+                <span className="text-[#846851]">Точок на карті</span>
+                <span className="font-bold text-[#411e03]">{occupancy.length}</span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Клієнтів на карті</span>
+                <span className="text-[#846851]">Клієнтів на карті</span>
                 <span className="font-semibold text-blue-600">{activeCustomers}</span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Staff на карті</span>
+                <span className="text-[#846851]">Staff на карті</span>
                 <span className="font-semibold text-emerald-600">{activeStaff}</span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Клієнтів у закладі</span>
-                <span className="font-semibold text-slate-900">{totalCustomers}</span>
+                <span className="text-[#846851]">Клієнтів у закладі</span>
+                <span className="font-semibold text-[#411e03]">{totalCustomers}</span>
               </div>
             </div>
           </CardContent>
@@ -931,19 +958,19 @@ function LiveMonitorSidePanel({
 
         <Card className="rounded-2xl border-slate-200 bg-white shadow-sm">
           <CardContent className="p-4">
-            <h2 className="mb-2 text-base font-semibold text-slate-900">🧍 Розподіл по зонах</h2>
+            <h2 className="mb-2 text-base font-semibold text-[#411e03]">🧍 Розподіл по зонах</h2>
             <ul className="space-y-1 text-sm text-slate-600">
               {mapZones.map((zone) => (
                 <li key={zone.id} className="flex items-center justify-between border-b border-slate-100 pb-0.5 last:border-0">
                   <span>{zone.name}</span>
-                  <span className="font-medium text-slate-900">
+                  <span className="font-medium text-[#411e03]">
                     {zoneCounts.counts[zone.id]} {zoneCounts.counts[zone.id] === 1 ? "людина" : "людей"}
                   </span>
                 </li>
               ))}
               <li className="flex items-center justify-between pt-0.5">
-                <span className="text-slate-400">В русі / Інше</span>
-                <span className="font-medium text-slate-500">{zoneCounts.otherCount}</span>
+                <span className="text-[#846851]">В русі / Інше</span>
+                <span className="font-medium text-[#846851]">{zoneCounts.otherCount}</span>
               </li>
             </ul>
           </CardContent>
@@ -953,7 +980,7 @@ function LiveMonitorSidePanel({
       <Card className="h-fit min-h-[420px] rounded-2xl border-slate-200 bg-white shadow-sm">
         <CardContent className="p-6">
           <div className="mb-4 border-b pb-2">
-            <h2 className="text-lg font-semibold text-slate-900">Live 2D Map (Дедупліковано)</h2>
+            <h2 className="text-lg font-semibold text-[#411e03]">Live 2D Map (Дедупліковано)</h2>
           </div>
           <div className="relative group/map h-auto w-full overflow-hidden rounded-lg">
             <input
@@ -964,33 +991,35 @@ function LiveMonitorSidePanel({
               id="floorPlanUpload"
               onChange={handleImageUpload}
             />
-            <div className="absolute top-4 right-4 z-10 flex flex-col items-end gap-2 opacity-0 transition-all duration-300 group-hover/map:opacity-100">
-              <button
-                type="button"
-                onClick={() => void handleAutoDetectZones()}
-                className="group flex items-center overflow-hidden rounded-full border border-slate-200 bg-white/90 p-2 shadow-md backdrop-blur transition-all duration-300 hover:pl-4 disabled:cursor-not-allowed disabled:opacity-60"
-                title="Авто-розпізнавання зон"
-                disabled={isAnalyzingZones}
-              >
-                <span className="max-w-0 overflow-hidden whitespace-nowrap text-sm font-medium text-slate-700 opacity-0 transition-all duration-300 group-hover:mr-2 group-hover:max-w-[160px] group-hover:opacity-100">
-                  Авто-розпізнавання
-                </span>
-                <span className="text-lg flex-shrink-0">{isAnalyzingZones ? "…" : "🔍"}</span>
-              </button>
+            {floorPlanImg && !floorPlanError && (
+              <div className="absolute top-4 right-4 z-10 flex flex-col items-end gap-2 opacity-0 transition-all duration-300 group-hover/map:opacity-100">
+                <button
+                  type="button"
+                  onClick={() => void handleAutoDetectZones()}
+                  className="group flex items-center overflow-hidden rounded-full border border-slate-200 bg-white/90 p-2 shadow-md backdrop-blur transition-all duration-300 hover:pl-4 disabled:cursor-not-allowed disabled:opacity-60"
+                  title="Авто-розпізнавання зон"
+                  disabled={isAnalyzingZones}
+                >
+                  <span className="max-w-0 overflow-hidden whitespace-nowrap text-sm font-medium text-slate-700 opacity-0 transition-all duration-300 group-hover:mr-2 group-hover:max-w-[160px] group-hover:opacity-100">
+                    Авто-розпізнавання
+                  </span>
+                  <span className="text-lg flex-shrink-0">{isAnalyzingZones ? "…" : "🔍"}</span>
+                </button>
 
-              <button
-                type="button"
-                onClick={() => document.getElementById("floorPlanUpload")?.click()}
-                className="group flex items-center overflow-hidden rounded-full border border-slate-200 bg-white/90 p-2 shadow-md backdrop-blur transition-all duration-300 hover:pl-4"
-                title="Змінити план"
-              >
-                <span className="max-w-0 overflow-hidden whitespace-nowrap text-sm font-medium text-slate-700 opacity-0 transition-all duration-300 group-hover:mr-2 group-hover:max-w-[120px] group-hover:opacity-100">
-                  Змінити план
-                </span>
-                <span className="text-lg flex-shrink-0">🗺️</span>
-              </button>
-            </div>
-            {!floorPlanError ? (
+                <button
+                  type="button"
+                  onClick={() => document.getElementById("floorPlanUpload")?.click()}
+                  className="group flex items-center overflow-hidden rounded-full border border-slate-200 bg-white/90 p-2 shadow-md backdrop-blur transition-all duration-300 hover:pl-4"
+                  title="Змінити план"
+                >
+                  <span className="max-w-0 overflow-hidden whitespace-nowrap text-sm font-medium text-slate-700 opacity-0 transition-all duration-300 group-hover:mr-2 group-hover:max-w-[120px] group-hover:opacity-100">
+                    Змінити план
+                  </span>
+                  <span className="text-lg flex-shrink-0">🗺️</span>
+                </button>
+              </div>
+            )}
+            {floorPlanImg && !floorPlanError ? (
               <div className="h-auto w-full overflow-auto">
                 <div
                   className="relative h-auto w-full"
@@ -1086,21 +1115,29 @@ function LiveMonitorSidePanel({
                 </div>
               </div>
             ) : (
-              <div className="flex h-full w-full items-center justify-center px-6 text-center text-sm text-slate-300">
-                Floor plan ще не завантажено. Додайте його в калібруванні камери, щоб побачити live 2D map.
-              </div>
+              <button
+                type="button"
+                onClick={() => floorPlanUploadRef.current?.click()}
+                className="flex h-[320px] w-full flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-white/60 px-6 text-center transition hover:bg-white"
+              >
+                <span className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-[#f5f3f0] text-3xl text-[#846851]">
+                  +
+                </span>
+                <span className="text-base font-semibold text-[#411e03]">Завантажити план приміщення</span>
+                <span className="mt-2 text-sm text-[#846851]">Додайте floor plan для вашого кафе</span>
+              </button>
             )}
             <div className="absolute right-4 bottom-4 z-10 flex flex-col gap-2 rounded-lg bg-white/80 p-1 opacity-0 shadow backdrop-blur transition-all duration-300 group-hover/map:opacity-100">
               <button
                 type="button"
-                className="flex h-9 w-9 items-center justify-center rounded-md text-lg font-semibold text-slate-900 hover:bg-white"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-lg font-semibold text-[#411e03] hover:bg-white"
                 onClick={handleZoomIn}
               >
                 +
               </button>
               <button
                 type="button"
-                className="flex h-9 w-9 items-center justify-center rounded-md text-lg font-semibold text-slate-900 hover:bg-white"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-lg font-semibold text-[#411e03] hover:bg-white"
                 onClick={handleZoomOut}
               >
                 -
@@ -1137,7 +1174,7 @@ function AddCameraCard({ onUpload }: { onUpload: (file: File) => void }) {
         <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-400 transition-transform group-hover:scale-110">
           ＋
         </div>
-        <span className="mt-3 text-sm font-medium text-slate-500 group-hover:text-emerald-600">
+        <span className="mt-3 text-sm font-medium text-[#846851] group-hover:text-emerald-600">
           Додати нову камеру
         </span>
       </div>
@@ -1146,14 +1183,99 @@ function AddCameraCard({ onUpload }: { onUpload: (file: File) => void }) {
 }
 
 export default function Dashboard() {
+  const [isAuthenticated, setIsAuthenticated] = useState(() => !!localStorage.getItem("cafe_token"));
+  const [authView, setAuthView] = useState<"login" | "register">("login");
+  const [currentUser, setCurrentUser] = useState<{ full_name: string; email: string } | null>(null);
+  const [myCafe, setMyCafe] = useState<MyCafe | null>(null);
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [cameras, setCameras] = useState<CameraData[]>([]);
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
   const [activeTab, setActiveTab] = useState<ActiveTab>("live");
   const [totalCustomers, setTotalCustomers] = useState(0);
-  const [floorPlanImg, setFloorPlanImg] = useState(FLOOR_PLAN_URL);
+  const [floorPlanImg, setFloorPlanImg] = useState("");
   const [mapZones, setMapZones] = useState<MapZone[]>([]);
   const [isEndingSession, setIsEndingSession] = useState(false);
   const nextCameraIdRef = useRef(1);
+  const profileDropdownRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!profileDropdownRef.current?.contains(event.target as Node)) {
+        setIsProfileOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, []);
+
+  useEffect(() => {
+    const fetchUser = async () => {
+      const token = localStorage.getItem("cafe_token");
+      if (!token) return;
+
+      try {
+        const response = await fetch("http://127.0.0.1:8000/api/auth/me", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          setCurrentUser(data);
+        } else {
+          localStorage.removeItem("cafe_token");
+          setCurrentUser(null);
+          setIsAuthenticated(false);
+        }
+      } catch (error) {
+        console.error("Error fetching user", error);
+      }
+    };
+
+    if (isAuthenticated) {
+      void fetchUser();
+    } else {
+      setCurrentUser(null);
+    }
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    const fetchCafe = async () => {
+      const token = localStorage.getItem("cafe_token");
+      if (!token) return;
+
+      try {
+        const response = await fetch("http://127.0.0.1:8000/api/cafes/me", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error("Не вдалося завантажити дані кафе.");
+        }
+
+        const data = await response.json();
+        setMyCafe(data);
+        setFloorPlanImg(data.floor_plan_url || "");
+      } catch (error) {
+        console.error("Помилка завантаження кафе:", error);
+        setMyCafe(null);
+        setFloorPlanImg("");
+      }
+    };
+
+    if (isAuthenticated) {
+      void fetchCafe();
+    } else {
+      setMyCafe(null);
+      setFloorPlanImg("");
+    }
+  }, [isAuthenticated]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1179,6 +1301,19 @@ export default function Dashboard() {
   }, [floorPlanImg]);
 
   useEffect(() => {
+    if (!floorPlanImg) {
+      setMyCafe((prev) => (prev ? { ...prev, floor_plan_url: "" } : prev));
+      return;
+    }
+
+    setMyCafe((prev) =>
+      prev
+        ? { ...prev, floor_plan_url: floorPlanImg }
+        : { name: "", floor_plan_url: floorPlanImg },
+    );
+  }, [floorPlanImg]);
+
+  useEffect(() => {
     if (sessionStatus !== "running") {
       setTotalCustomers(0);
       return;
@@ -1188,7 +1323,9 @@ export default function Dashboard() {
 
     const loadOccupancy = async () => {
       try {
-        const response = await fetch("http://localhost:8000/api/occupancy");
+        const response = await fetch("http://localhost:8000/api/occupancy", {
+          headers: getAuthHeaders(),
+        });
         const data = await response.json();
         if (!cancelled) {
           setTotalCustomers(Number(data.total_customers ?? 0));
@@ -1219,7 +1356,11 @@ export default function Dashboard() {
     formData.append("camera_id", id.toString());
 
     try {
-      const res = await fetch("http://localhost:8000/upload_video", { method: "POST", body: formData });
+      const res = await fetch("http://localhost:8000/upload_video", {
+        method: "POST",
+        headers: getAuthHeaders(),
+        body: formData,
+      });
       const data = await res.json();
 
       setCameras((prev) =>
@@ -1251,7 +1392,11 @@ export default function Dashboard() {
     formData.append("camera_id", id.toString());
 
     try {
-      const res = await fetch("http://localhost:8000/upload_video", { method: "POST", body: formData });
+      const res = await fetch("http://localhost:8000/upload_video", {
+        method: "POST",
+        headers: getAuthHeaders(),
+        body: formData,
+      });
       const data = await res.json();
       setCameras((prev) =>
         prev.map((c) =>
@@ -1278,7 +1423,10 @@ export default function Dashboard() {
 
     setIsEndingSession(true);
     try {
-      const response = await fetch("http://localhost:8000/api/end_session", { method: "POST" });
+      const response = await fetch("http://localhost:8000/api/end_session", {
+        method: "POST",
+        headers: getAuthHeaders(),
+      });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -1297,27 +1445,63 @@ export default function Dashboard() {
     }
   };
 
+  const handleLogout = () => {
+    localStorage.removeItem("cafe_token");
+    setCurrentUser(null);
+    setMyCafe(null);
+    setFloorPlanImg("");
+    setIsProfileOpen(false);
+    setIsAuthenticated(false);
+    setAuthView("login");
+  };
+
+  if (!isAuthenticated) {
+    return authView === "login" ? (
+      <Login
+        onLogin={() => setIsAuthenticated(true)}
+        onNavigateToRegister={() => setAuthView("register")}
+      />
+    ) : (
+      <Register
+        onLogin={() => setIsAuthenticated(true)}
+        onNavigateToLogin={() => setAuthView("login")}
+      />
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-slate-50 font-sans">
+    <div className="min-h-screen bg-[#f5f3f0] font-sans">
       <div className="grid w-full gap-6 px-[30px] py-6">
         <header className="flex flex-col justify-between gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm transition-all duration-300 lg:flex-row lg:items-center">
-          <div>
-            <h1 className="text-xl font-bold text-slate-900">☕ Cafe Monitor</h1>
-            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-              {activeTab === "live" ? (
-                <>
-                  Статус сесії:{" "}
-                  <span className={sessionStatus === "running" ? "text-emerald-500" : "text-slate-400"}>
-                    {sessionStatus === "idle" ? "Очікує запуску" : sessionStatus}
-                  </span>
-                </>
-              ) : (
-                "MongoDB analytics dashboard"
-              )}
-            </p>
+          <div className="flex items-center gap-6">
+            <div>
+              <h1 className="text-xl font-bold text-[#411e03]">☕ Cafe Monitor</h1>
+              <p className="text-xs font-semibold uppercase tracking-wider text-[#846851]">
+                {activeTab === "live" ? (
+                  <>
+                    Статус сесії:{" "}
+                    <span className={sessionStatus === "running" ? "text-emerald-500" : "text-slate-400"}>
+                      {sessionStatus === "idle" ? "Очікує запуску" : sessionStatus}
+                    </span>
+                  </>
+                ) : (
+                  "MongoDB analytics dashboard"
+                )}
+              </p>
+            </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-wrap items-center gap-4">
+            {activeTab === "live" && sessionStatus === "idle" && (
+              <Button
+                className="rounded-xl bg-emerald-600 px-6 text-white shadow-lg shadow-emerald-200 transition-all active:scale-95 hover:bg-emerald-700"
+                onClick={() => setSessionStatus("running")}
+                disabled={cameras.length === 0}
+              >
+                ▶ Почати сесію
+              </Button>
+            )}
+
             <div className="flex gap-2">
               <Button
                 onClick={() => setActiveTab("live")}
@@ -1335,16 +1519,46 @@ export default function Dashboard() {
               </Button>
             </div>
 
+            <div className="relative" ref={profileDropdownRef}>
+              <button
+                onClick={() => setIsProfileOpen(!isProfileOpen)}
+                className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white py-1.5 pl-2 pr-3 shadow-sm transition-colors hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-[#8a895f]"
+              >
+                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[#411e03] text-sm font-bold text-white">
+                  {currentUser?.full_name ? currentUser.full_name.charAt(0).toUpperCase() : "U"}
+                </div>
+                <span className="hidden text-sm font-medium text-[#411e03] sm:block">Профіль</span>
+                <ChevronDown
+                  size={16}
+                  className={`text-[#846851] transition-transform duration-200 ${isProfileOpen ? "rotate-180" : ""}`}
+                />
+              </button>
+
+              {isProfileOpen && (
+                <div className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-slate-100 bg-white py-2 shadow-xl">
+                  <div className="mb-1 border-b border-slate-100 px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <User size={14} className="text-[#846851]" />
+                      <p className="text-sm font-bold text-[#411e03]">{currentUser?.full_name || "User"}</p>
+                    </div>
+                    <p className="mt-0.5 truncate text-xs text-[#846851]">{currentUser?.email || ""}</p>
+                  </div>
+
+                  <div className="px-2">
+                    <button
+                      onClick={handleLogout}
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
+                    >
+                      <LogOut size={16} />
+                      Вийти з акаунта
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {activeTab === "live" &&
-              (sessionStatus === "idle" ? (
-                <Button
-                  className="rounded-xl bg-emerald-600 px-6 text-white shadow-lg shadow-emerald-200 transition-all active:scale-95 hover:bg-emerald-700"
-                  onClick={() => setSessionStatus("running")}
-                  disabled={cameras.length === 0}
-                >
-                  ▶ Почати сесію
-                </Button>
-              ) : (
+              (sessionStatus === "idle" ? null : (
                 <div className="flex gap-2">
                   <Button
                     variant="outline"
@@ -1401,7 +1615,13 @@ export default function Dashboard() {
         </div>
 
         <div className={activeTab === "analytics" ? "block" : "hidden"}>
-          <Analytics />
+          <Analytics
+            externalCafe={myCafe}
+            onCafeUpdate={(cafe) => {
+              setMyCafe(cafe);
+              setFloorPlanImg(cafe.floor_plan_url || "");
+            }}
+          />
         </div>
       </div>
     </div>

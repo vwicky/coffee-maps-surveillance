@@ -1,15 +1,14 @@
 import { useEffect, useRef, useState } from "react";
+import * as heatmapModule from "heatmap.js";
 import jsPDF from "jspdf";
 import { toPng } from "html-to-image";
 import {
   Bar,
   BarChart,
   CartesianGrid,
-  Cell,
+  Legend,
   Line,
   LineChart,
-  Pie,
-  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -20,60 +19,117 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "../components/ui/tabs";
 import {
-  Calendar,
   Clock,
   Download,
+  Info,
   MapPinned,
   RefreshCw,
+  TrendingDown,
   TrendingUp,
   Users,
+  X,
   Zap,
 } from "lucide-react";
-
-interface ChartDatum {
-  label: string;
-  count: number;
-}
-
-interface StatsGroup {
-  total_customers: number;
-  gender_distribution: ChartDatum[];
-  age_groups: ChartDatum[];
-  average_duration_sec?: number;
-  peak_hour?: string;
-}
-
-interface ZoneStat {
-  name: string;
-  avg_time_sec: number;
-  percent: number;
-}
 
 interface HeatmapPoint {
   x: number;
   y: number;
-  weight: number;
 }
 
-interface StatsResponse {
-  overall: StatsGroup;
-  by_date: Record<string, StatsGroup>;
-  zone_stats: ZoneStat[];
-  heatmap_points: HeatmapPoint[];
-  floor_plan_url?: string | null;
+interface HeatmapDatum {
+  x: number;
+  y: number;
+  value: number;
+}
+
+interface HeatmapInstance {
+  setData: (data: { max: number; min: number; data: HeatmapDatum[] }) => void;
+}
+
+interface MyCafe {
+  name: string;
+  address?: string;
+  floor_plan_url: string;
+}
+
+interface SummaryMetric {
+  value: number | string;
+  trend?: number;
+  is_positive?: boolean;
+}
+
+interface AnalyticsSummary {
+  total_customers?: SummaryMetric;
+  avg_time?: SummaryMetric;
+  peak_hour?: {
+    value?: string;
+    subtext?: string;
+  };
+}
+
+interface DemographicsDatum {
+  age_group: string;
+  Чоловіки: number;
+  Жінки: number;
+}
+
+interface DynamicsDatum {
+  time?: string;
+  date?: string;
+  customers: number;
+}
+
+interface HistoryRow {
+  date: string;
+  total: number;
+  avg_time: string;
+  peak: string;
+  gender: string;
+  top_age: string;
+}
+
+interface ZoneAnalyticsRow {
+  name: string;
+  avg_time: string;
+  visits: number;
+  percentage: number;
+  color: string;
+}
+
+interface RouteAnalyticsRow {
+  path: string;
+  percentage: number;
 }
 
 const API_ROOT = "http://localhost:8000";
-const FLOOR_PLAN_URL = `${API_ROOT}/floor_plan`;
-const PIE_COLORS = ["#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#64748b"];
+const ORIGINAL_WIDTH = 1920;
+const ORIGINAL_HEIGHT = 1080;
+
+type HeatmapFactory = {
+  create: (config: Record<string, unknown>) => HeatmapInstance;
+};
+
+function resolveHeatmapFactory(): HeatmapFactory | null {
+  const raw = heatmapModule as unknown as { default?: HeatmapFactory } & Partial<HeatmapFactory>;
+  if (typeof raw.create === "function") {
+    return raw as HeatmapFactory;
+  }
+  if (raw.default && typeof raw.default.create === "function") {
+    return raw.default;
+  }
+  return null;
+}
 
 const buildFloorPlanSrc = (url?: string | null, cacheKey?: number) => {
   const rawUrl = (url || "").trim();
-  const baseUrl = rawUrl
-    ? rawUrl.startsWith("http://") || rawUrl.startsWith("https://") || rawUrl.startsWith("data:")
+  if (!rawUrl) {
+    return "";
+  }
+
+  const baseUrl =
+    rawUrl.startsWith("http://") || rawUrl.startsWith("https://") || rawUrl.startsWith("data:")
       ? rawUrl
-      : `${API_ROOT}${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`
-    : FLOOR_PLAN_URL;
+      : `${API_ROOT}${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
 
   if (!cacheKey || baseUrl.startsWith("data:")) {
     return baseUrl;
@@ -83,14 +139,6 @@ const buildFloorPlanSrc = (url?: string | null, cacheKey?: number) => {
   return `${baseUrl}${separator}t=${cacheKey}`;
 };
 
-const formatDuration = (seconds: number | undefined) => {
-  if (!seconds) return "0 хв";
-  const safeSeconds = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0;
-  const minutes = Math.floor(safeSeconds / 60);
-  const remainingSeconds = safeSeconds % 60;
-  return `${minutes} хв ${remainingSeconds} с`;
-};
-
 function AnalyticsHeatmap({
   floorPlanUrl,
   points,
@@ -98,92 +146,193 @@ function AnalyticsHeatmap({
   floorPlanUrl?: string | null;
   points: HeatmapPoint[];
 }) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [imageReady, setImageReady] = useState(false);
+  const heatmapLayerRef = useRef<HTMLDivElement>(null);
+  const heatmapInstanceRef = useRef<HeatmapInstance | null>(null);
   const [imageError, setImageError] = useState(false);
-  const [cacheKey, setCacheKey] = useState(() => Date.now());
-  const resolvedFloorPlanUrl = buildFloorPlanSrc(floorPlanUrl, cacheKey);
+  const resolvedFloorPlanUrl = buildFloorPlanSrc(floorPlanUrl);
+  const [overlayBounds, setOverlayBounds] = useState({ left: 16, top: 16, width: 0, height: 0 });
+  const [layoutTick, setLayoutTick] = useState(0);
 
   useEffect(() => {
-    setCacheKey(Date.now());
-    setImageReady(false);
-    setImageError(false);
-  }, [floorPlanUrl]);
-
-  const drawHeatmap = () => {
+    const wrapper = wrapperRef.current;
     const image = imageRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!image || !canvas || !ctx) return;
+    if (!wrapper || !image) {
+      return;
+    }
 
-    const canvasWidth = image.clientWidth;
-    const canvasHeight = image.clientHeight;
-    if (canvasWidth <= 0 || canvasHeight <= 0) return;
+    const updateOverlayBounds = () => {
+      const wrapperWidth = wrapper.clientWidth;
+      const wrapperHeight = wrapper.clientHeight;
+      if (wrapperWidth <= 0 || wrapperHeight <= 0) {
+        return;
+      }
 
-    if (canvas.width !== canvasWidth) canvas.width = canvasWidth;
-    if (canvas.height !== canvasHeight) canvas.height = canvasHeight;
+      const imageStyles = window.getComputedStyle(image);
+      const paddingLeft = parseFloat(imageStyles.paddingLeft || "0") || 0;
+      const paddingRight = parseFloat(imageStyles.paddingRight || "0") || 0;
+      const paddingTop = parseFloat(imageStyles.paddingTop || "0") || 0;
+      const paddingBottom = parseFloat(imageStyles.paddingBottom || "0") || 0;
+      const contentWidth = Math.max(0, wrapperWidth - paddingLeft - paddingRight);
+      const contentHeight = Math.max(0, wrapperHeight - paddingTop - paddingBottom);
+      if (contentWidth <= 0 || contentHeight <= 0) {
+        return;
+      }
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!points.length || !image.naturalWidth || !image.naturalHeight) return;
+      const denomW = ORIGINAL_WIDTH > 0 ? ORIGINAL_WIDTH : 1;
+      const denomH = ORIGINAL_HEIGHT > 0 ? ORIGINAL_HEIGHT : 1;
+      const scale = Math.min(contentWidth / denomW, contentHeight / denomH);
+      if (!Number.isFinite(scale) || scale <= 0) {
+        return;
+      }
+      const renderedWidth = ORIGINAL_WIDTH * scale;
+      const renderedHeight = ORIGINAL_HEIGHT * scale;
+      const offsetLeft = paddingLeft + (contentWidth - renderedWidth) / 2;
+      const offsetTop = paddingTop + (contentHeight - renderedHeight) / 2;
 
-    const scaleX = canvas.width / image.naturalWidth;
-    const scaleY = canvas.height / image.naturalHeight;
+      setOverlayBounds({
+        left: offsetLeft,
+        top: offsetTop,
+        width: renderedWidth,
+        height: renderedHeight,
+      });
+    };
 
-    points.forEach((point) => {
-      const x = point.x * scaleX;
-      const y = point.y * scaleY;
-      const radius = 25;
-      const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
-      gradient.addColorStop(0, "rgba(255, 0, 0, 0.2)");
-      gradient.addColorStop(0.5, "rgba(255, 165, 0, 0.1)");
-      gradient.addColorStop(1, "rgba(255, 255, 0, 0)");
-
-      ctx.beginPath();
-      ctx.arc(x, y, radius, 0, 2 * Math.PI);
-      ctx.fillStyle = gradient;
-      ctx.fill();
-    });
-  };
-
-  useEffect(() => {
-    drawHeatmap();
-  }, [imageReady, points, resolvedFloorPlanUrl]);
-
-  useEffect(() => {
-    const image = imageRef.current;
-    if (!image || typeof ResizeObserver === "undefined") return;
-
+    updateOverlayBounds();
     const resizeObserver = new ResizeObserver(() => {
-      drawHeatmap();
+      updateOverlayBounds();
     });
-    resizeObserver.observe(image);
+    resizeObserver.observe(wrapper);
+
+    const onWinResize = () => updateOverlayBounds();
+    window.addEventListener("resize", onWinResize);
 
     return () => {
       resizeObserver.disconnect();
+      window.removeEventListener("resize", onWinResize);
     };
-  }, [imageReady, points, resolvedFloorPlanUrl]);
+  }, [floorPlanUrl, layoutTick]);
+
+  useEffect(() => {
+    const container = heatmapLayerRef.current;
+    if (!container) {
+      return;
+    }
+
+    if (container.offsetWidth === 0 || container.offsetHeight === 0) {
+      return;
+    }
+    if (overlayBounds.width <= 0 || overlayBounds.height <= 0) {
+      return;
+    }
+
+    const scaleX = overlayBounds.width / ORIGINAL_WIDTH;
+    const scaleY = overlayBounds.height / ORIGINAL_HEIGHT;
+    if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0) {
+      return;
+    }
+
+    const safePoints = Array.isArray(points)
+      ? points.filter(
+          (p): p is HeatmapPoint =>
+            p != null &&
+            typeof p === "object" &&
+            typeof p.x === "number" &&
+            typeof p.y === "number" &&
+            Number.isFinite(p.x) &&
+            Number.isFinite(p.y),
+        )
+      : [];
+
+    const scaledPoints: HeatmapDatum[] = safePoints
+      .map((point) => {
+        const x = Math.round(point.x * scaleX);
+        const y = Math.round(point.y * scaleY);
+        return { x, y, value: 1 };
+      })
+      .filter(
+        (point) =>
+          Number.isFinite(point.x) &&
+          Number.isFinite(point.y) &&
+          point.x >= 0 &&
+          point.y >= 0 &&
+          point.x <= overlayBounds.width &&
+          point.y <= overlayBounds.height,
+      );
+
+    heatmapInstanceRef.current = null;
+
+    try {
+      const factory = resolveHeatmapFactory();
+      if (!factory) {
+        console.error("Heatmap init failed:", new Error("heatmap.js create export not found"));
+        return;
+      }
+
+      container.innerHTML = "";
+      heatmapInstanceRef.current = factory.create({
+        container,
+        radius: 28,
+        maxOpacity: 0.55,
+        minOpacity: 0.05,
+        blur: 0.9,
+        gradient: {
+          0.25: "#22c55e",
+          0.5: "#eab308",
+          0.75: "#f97316",
+          1: "#ef4444",
+        },
+      }) as HeatmapInstance;
+
+      const instance = heatmapInstanceRef.current;
+      if (instance && typeof instance.setData === "function") {
+        instance.setData({
+          max: 5,
+          min: 0,
+          data: scaledPoints,
+        });
+      }
+    } catch (err) {
+      console.error("Heatmap init failed:", err);
+      heatmapInstanceRef.current = null;
+    }
+
+    return () => {
+      heatmapInstanceRef.current = null;
+      if (heatmapLayerRef.current) {
+        heatmapLayerRef.current.innerHTML = "";
+      }
+    };
+  }, [points, overlayBounds, layoutTick]);
 
   return (
-    <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-100">
+    <div ref={wrapperRef} className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg bg-white">
       <img
         ref={imageRef}
         src={resolvedFloorPlanUrl}
         alt="Floor plan"
-        crossOrigin="anonymous"
-        className="w-full h-auto object-contain rounded-lg"
+        className="w-full h-full object-contain pointer-events-none p-4"
         onLoad={() => {
           setImageError(false);
-          setImageReady(true);
+          setLayoutTick((t) => t + 1);
         }}
         onError={() => {
-          setImageReady(false);
           setImageError(true);
         }}
       />
-      <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
+      <div
+        ref={heatmapLayerRef}
+        className="pointer-events-none absolute"
+        style={{
+          left: `${overlayBounds.left}px`,
+          top: `${overlayBounds.top}px`,
+          width: `${overlayBounds.width}px`,
+          height: `${overlayBounds.height}px`,
+        }}
+      />
       {imageError && (
-        <div className="absolute inset-0 flex items-center justify-center bg-white/90 text-sm text-slate-500">
+        <div className="absolute inset-0 flex items-center justify-center bg-white/90 text-sm text-[#846851]">
           Не вдалося завантажити план приміщення.
         </div>
       )}
@@ -196,32 +345,103 @@ function AnalyticsHeatmap({
   );
 }
 
-export default function Analytics() {
+export default function Analytics({
+  externalCafe,
+  onCafeUpdate,
+}: {
+  externalCafe?: MyCafe | null;
+  onCafeUpdate?: (cafe: MyCafe) => void;
+}) {
   const dashboardRef = useRef<HTMLDivElement>(null);
-  const [stats, setStats] = useState<StatsResponse | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [summary, setSummary] = useState<AnalyticsSummary | null>(null);
+  const [dynamicsData, setDynamicsData] = useState<DynamicsDatum[]>([]);
+  const [demographics, setDemographics] = useState<DemographicsDatum[]>([]);
+  const [historyData, setHistoryData] = useState<HistoryRow[]>([]);
+  const [zoneData, setZoneData] = useState<ZoneAnalyticsRow[]>([]);
+  const [routesData, setRoutesData] = useState<RouteAnalyticsRow[]>([]);
+  const [heatmapPoints, setHeatmapPoints] = useState<HeatmapPoint[]>([]);
+  const [myCafe, setMyCafe] = useState<MyCafe | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
+  const [isUploadingPlan, setIsUploadingPlan] = useState(false);
   const [dateTab, setDateTab] = useState("today");
   const [customDate, setCustomDate] = useState("");
-  const [timeRange, setTimeRange] = useState("00:00 - 23:59");
+  const [timeRange, setTimeRange] = useState("");
+  const [dynamicsView, setDynamicsView] = useState<"hours" | "days">("hours");
 
   const loadStats = async () => {
     setLoading(true);
     setError(null);
 
     try {
-      const params = new URLSearchParams({
-        tab: dateTab,
-        date: customDate,
-        time: timeRange,
-      });
-      const response = await fetch(`${API_ROOT}/api/stats?${params.toString()}`);
-      const data: StatsResponse = await response.json();
-      if (!response.ok) {
+      const token = localStorage.getItem("cafe_token");
+      const headers = token
+        ? {
+            Authorization: `Bearer ${token}`,
+          }
+        : undefined;
+
+      const [
+        summaryResponse,
+        dynamicsResponse,
+        demographicsResponse,
+        historyResponse,
+        zonesResponse,
+        routesResponse,
+        heatmapResponse,
+      ] = await Promise.all([
+        fetch("http://127.0.0.1:8000/api/analytics/summary", {
+          headers,
+        }),
+        fetch(`http://127.0.0.1:8000/api/analytics/dynamics?view=${dynamicsView}`, {
+          headers,
+        }),
+        fetch("http://127.0.0.1:8000/api/analytics/demographics", {
+          headers,
+        }),
+        fetch("http://127.0.0.1:8000/api/analytics/history", {
+          headers,
+        }),
+        fetch("http://127.0.0.1:8000/api/analytics/zones", {
+          headers,
+        }),
+        fetch("http://127.0.0.1:8000/api/analytics/routes", {
+          headers,
+        }),
+        fetch("http://127.0.0.1:8000/api/analytics/heatmap", {
+          headers,
+        }),
+      ]);
+
+      const summaryData: AnalyticsSummary = await summaryResponse.json();
+      const dynamicsRows: DynamicsDatum[] = await dynamicsResponse.json();
+      const demographicsData: DemographicsDatum[] = await demographicsResponse.json();
+      const historyRows: HistoryRow[] = await historyResponse.json();
+      const zonesRows: ZoneAnalyticsRow[] = await zonesResponse.json();
+      const routesRows: RouteAnalyticsRow[] = await routesResponse.json();
+      const heatmapRows: HeatmapPoint[] = await heatmapResponse.json();
+
+      if (
+        !summaryResponse.ok ||
+        !dynamicsResponse.ok ||
+        !demographicsResponse.ok ||
+        !historyResponse.ok ||
+        !zonesResponse.ok ||
+        !routesResponse.ok ||
+        !heatmapResponse.ok
+      ) {
         throw new Error("Не вдалося завантажити аналітику.");
       }
-      setStats(data);
+
+      setSummary(summaryData);
+      setDynamicsData(dynamicsRows);
+      setDemographics(demographicsData);
+      setHistoryData(historyRows);
+      setZoneData(zonesRows);
+      setRoutesData(routesRows);
+      setHeatmapPoints(heatmapRows);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Не вдалося завантажити аналітику.");
     } finally {
@@ -237,22 +457,90 @@ export default function Analytics() {
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [dateTab, customDate, timeRange]);
+  }, [dateTab, customDate, timeRange, dynamicsView]);
 
-  const genderData = stats?.overall.gender_distribution ?? [];
-  const ageData = stats?.overall.age_groups ?? [];
-  const zoneStats = stats?.zone_stats ?? [];
-  const heatmapPoints = stats?.heatmap_points ?? [];
-  const byDateEntries = Object.entries(stats?.by_date ?? {});
-  const trendData = byDateEntries.map(([date, group]) => ({
-    date: date.substring(5),
-    customers: group.total_customers,
-  }));
+  useEffect(() => {
+    const fetchCafe = async () => {
+      const token = localStorage.getItem("cafe_token");
+      if (!token) {
+        return;
+      }
 
-  const formatBreakdown = (items: ChartDatum[], labelMap?: Record<string, string>) =>
-    items.length > 0
-      ? items.map((item) => `${labelMap?.[item.label] ?? item.label}: ${item.count}`).join(", ")
-      : "—";
+      try {
+        const response = await fetch("http://127.0.0.1:8000/api/cafes/me", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error("Не вдалося завантажити дані кафе.");
+        }
+
+        const data = await response.json();
+        setMyCafe(data);
+        onCafeUpdate?.(data);
+      } catch (fetchError) {
+        console.error("Помилка завантаження кафе:", fetchError);
+      }
+    };
+
+    void fetchCafe();
+  }, []);
+
+  useEffect(() => {
+    if (externalCafe) {
+      setMyCafe(externalCafe);
+    }
+  }, [externalCafe]);
+
+  const isCustomFilterActive = dateTab !== "today" || Boolean(customDate) || Boolean(timeRange);
+
+  const resetFilters = () => {
+    setDateTab("today");
+    setCustomDate("");
+    setTimeRange("");
+  };
+
+  const dynamicsXAxisKey = dynamicsView === "hours" ? "time" : "date";
+
+  const handleFileUpload = async (file: File) => {
+    const token = localStorage.getItem("cafe_token");
+    if (!token) {
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", file);
+    setIsUploadingPlan(true);
+
+    try {
+      const response = await fetch("http://127.0.0.1:8000/api/cafes/me/floor-plan", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        body: formData,
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Не вдалося завантажити план приміщення.");
+      }
+
+      const nextCafe = {
+        name: myCafe?.name || "",
+        address: myCafe?.address || "",
+        floor_plan_url: data.floor_plan_url,
+      };
+      setMyCafe(nextCafe);
+      onCafeUpdate?.(nextCafe);
+    } catch (uploadError) {
+      console.error("Помилка завантаження плану приміщення:", uploadError);
+    } finally {
+      setIsUploadingPlan(false);
+    }
+  };
 
   const handleExportPDF = async () => {
     if (!dashboardRef.current) return;
@@ -281,359 +569,458 @@ export default function Analytics() {
   };
 
   return (
-    <div className="min-h-full w-full space-y-6 bg-slate-50 py-2 font-sans text-slate-900">
-      {error && (
-        <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm font-medium text-rose-600">
-          Помилка: {error}
-        </div>
-      )}
+    <div className="min-h-full w-full bg-[#f5f3f0] pt-6 font-sans text-[#411e03]">
+      <div className="max-w-[1600px] mx-auto w-full">
+        <div className="flex flex-col gap-6">
+          {error && (
+            <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm font-medium text-rose-600">
+              Помилка: {error}
+            </div>
+          )}
 
-      <div ref={dashboardRef} className="space-y-8 rounded-xl bg-slate-50 py-4">
-        <div className="mb-6 flex flex-col items-start justify-between gap-4 xl:flex-row xl:items-center">
-          <div className="flex flex-wrap items-center gap-3">
-            <Tabs value={dateTab} onValueChange={setDateTab} className="w-auto">
-              <TabsList className="h-10 border border-slate-200 bg-white shadow-sm">
-                <TabsTrigger value="today" className="data-[state=active]:bg-slate-100">
-                  Сьогодні
-                </TabsTrigger>
-                <TabsTrigger value="7days" className="data-[state=active]:bg-slate-100">
-                  7 днів
-                </TabsTrigger>
-                <TabsTrigger value="30days" className="data-[state=active]:bg-slate-100">
-                  30 днів
-                </TabsTrigger>
-                <TabsTrigger value="all" className="data-[state=active]:bg-slate-100">
-                  Весь час
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
+          <div ref={dashboardRef} className="flex flex-col gap-6 rounded-xl bg-[#f5f3f0]">
+            <div className="flex flex-col items-start justify-between gap-4 xl:flex-row xl:items-center">
+              <div className="flex flex-wrap items-center gap-3">
+                <Tabs
+                  value={dateTab}
+                  onValueChange={(value) => {
+                    setDateTab(value);
+                    setCustomDate("");
+                    setTimeRange("");
+                  }}
+                  className="w-auto"
+                >
+                  <TabsList className="h-10 border border-slate-200 bg-white shadow-sm">
+                    <TabsTrigger value="today" className="data-[state=active]:bg-slate-100">
+                      Сьогодні
+                    </TabsTrigger>
+                    <TabsTrigger value="7days" className="data-[state=active]:bg-slate-100">
+                      7 днів
+                    </TabsTrigger>
+                    <TabsTrigger value="30days" className="data-[state=active]:bg-slate-100">
+                      30 днів
+                    </TabsTrigger>
+                    <TabsTrigger value="all" className="data-[state=active]:bg-slate-100">
+                      Весь час
+                    </TabsTrigger>
+                  </TabsList>
+                </Tabs>
 
-            <div className="flex items-center gap-3">
-              <div className="relative">
-                <Calendar size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <Input
-                  type="date"
-                  value={customDate}
-                  onChange={(event) => setCustomDate(event.target.value)}
-                  className="h-10 w-40 border-slate-200 bg-white pl-10 text-slate-700 shadow-sm"
-                />
+                <div className="flex items-center gap-3">
+                  <div className="relative">
+                    <Input
+                      type="date"
+                      value={customDate}
+                      onChange={(event) => {
+                        setCustomDate(event.target.value);
+                        setDateTab("");
+                      }}
+                      className="h-10 w-40 border-[#d7cdc1] bg-white px-3 pr-8 text-[#411e03] shadow-sm focus-visible:ring-[#8a895f]"
+                    />
+                    {customDate && (
+                      <button
+                        type="button"
+                        onClick={() => setCustomDate("")}
+                        className="absolute top-1/2 right-2 -translate-y-1/2 text-[#846851] transition-colors hover:text-[#411e03]"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="relative">
+                    <Clock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <Input
+                      type="text"
+                      placeholder="00:00 - 23:59"
+                      value={timeRange}
+                      onChange={(event) => {
+                        setTimeRange(event.target.value);
+                        setDateTab("");
+                      }}
+                      className="h-10 w-36 border-[#d7cdc1] bg-white pl-10 pr-8 text-[#411e03] shadow-sm focus-visible:ring-[#8a895f]"
+                    />
+                    {timeRange && (
+                      <button
+                        type="button"
+                        onClick={() => setTimeRange("")}
+                        className="absolute top-1/2 right-2 -translate-y-1/2 text-[#846851] transition-colors hover:text-[#411e03]"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
-              <div className="relative">
-                <Clock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <Input
-                  type="text"
-                  placeholder="00:00 - 23:59"
-                  value={timeRange}
-                  onChange={(event) => setTimeRange(event.target.value)}
-                  className="h-10 w-36 border-slate-200 bg-white pl-10 text-slate-700 shadow-sm"
-                />
+
+              <div className="flex items-center gap-3">
+                <Button
+                  variant="ghost"
+                  onClick={resetFilters}
+                  disabled={!isCustomFilterActive}
+                  className="text-[#846851] hover:bg-[#f5f3f0] hover:text-[#411e03]"
+                >
+                  Скинути
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => void loadStats()}
+                  disabled={loading}
+                  className="gap-2 border-slate-200 bg-white text-slate-600 shadow-sm hover:bg-[#f5f3f0]"
+                >
+                  <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
+                  {loading ? "Оновлення..." : "Оновити"}
+                </Button>
+                <Button
+                  onClick={handleExportPDF}
+                  disabled={isExporting}
+                  className="gap-2 bg-emerald-600 text-white shadow-sm hover:bg-emerald-700"
+                >
+                  {isExporting ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
+                  {isExporting ? "Генерація..." : "Експорт"}
+                </Button>
               </div>
             </div>
-          </div>
 
-          <div className="flex items-center gap-3">
-            <Button
-              variant="outline"
-              onClick={() => void loadStats()}
-              disabled={loading}
-              className="gap-2 border-slate-200 bg-white text-slate-600 shadow-sm hover:bg-slate-50"
-            >
-              <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
-              {loading ? "Оновлення..." : "Оновити"}
-            </Button>
-            <Button
-              onClick={handleExportPDF}
-              disabled={isExporting}
-              className="gap-2 bg-emerald-600 text-white shadow-sm hover:bg-emerald-700"
-            >
-              {isExporting ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
-              {isExporting ? "Генерація..." : "Експорт"}
-            </Button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <Card className="border-slate-200 shadow-sm transition-shadow hover:shadow-md">
-            <CardContent className="flex items-center gap-4 p-5">
-              <div className="rounded-xl bg-blue-50 p-3 text-blue-600">
-                <Users size={24} />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-slate-500">Всього клієнтів</p>
-                <h3 className="text-2xl font-bold text-slate-800">{stats?.overall?.total_customers ?? 0}</h3>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-slate-200 shadow-sm transition-shadow hover:shadow-md">
-            <CardContent className="flex items-center gap-4 p-5">
-              <div className="rounded-xl bg-emerald-50 p-3 text-emerald-600">
-                <Clock size={24} />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-slate-500">Сер. час перебування</p>
-                <h3 className="text-2xl font-bold text-slate-800">
-                  {formatDuration(stats?.overall?.average_duration_sec)}
-                </h3>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-slate-200 shadow-sm transition-shadow hover:shadow-md">
-            <CardContent className="flex items-center gap-4 p-5">
-              <div className="rounded-xl bg-amber-50 p-3 text-amber-600">
-                <Zap size={24} />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-slate-500">Година пік</p>
-                <h3 className="text-2xl font-bold text-slate-800">{stats?.overall?.peak_hour ?? "—"}</h3>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-          <Card className="border-slate-200 shadow-sm lg:col-span-2">
-            <CardHeader className="pb-4">
-              <CardTitle className="flex items-center gap-2 text-lg font-semibold text-slate-800">
-                <TrendingUp size={18} className="text-emerald-500" />
-                Динаміка відвідуваності по датах
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="h-[280px] w-full">
-                {trendData.length > 0 ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={trendData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
-                      <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
-                      <XAxis
-                        dataKey="date"
-                        axisLine={false}
-                        tickLine={false}
-                        tick={{ fill: "#64748b", fontSize: 12 }}
-                        dy={10}
-                      />
-                      <YAxis axisLine={false} tickLine={false} tick={{ fill: "#64748b", fontSize: 12 }} />
-                      <Tooltip
-                        contentStyle={{
-                          borderRadius: "8px",
-                          border: "none",
-                          boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)",
-                        }}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="customers"
-                        name="Клієнти"
-                        stroke="#10b981"
-                        strokeWidth={3}
-                        dot={{ r: 4, fill: "#10b981", strokeWidth: 2 }}
-                        activeDot={{ r: 6 }}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <div className="flex h-full items-center justify-center text-sm text-slate-400">
-                    Немає даних для графіка
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <Card className="border-[#d7cdc1] bg-white shadow-sm transition-shadow hover:shadow-md">
+                <CardContent className="flex items-center gap-3 p-4">
+                  <div className="rounded-xl bg-blue-50 p-2.5 text-blue-600">
+                    <Users size={20} />
                   </div>
-                )}
-              </div>
-            </CardContent>
-          </Card>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-[#846851]">Всього клієнтів</p>
+                    <div className="text-2xl font-bold text-[#411e03]">{summary?.total_customers?.value || 0}</div>
+                    {summary?.total_customers?.trend && (
+                      <div
+                        className={`mt-1.5 flex items-center gap-1 text-sm font-medium ${
+                          summary.total_customers.is_positive ? "text-[#8a895f]" : "text-red-500/80"
+                        }`}
+                      >
+                        {summary.total_customers.is_positive ? <TrendingUp size={16} /> : <TrendingDown size={16} />}
+                        <span>{summary.total_customers.trend}%</span>
+                        <span className="ml-1 font-normal text-[#846851]">від учора</span>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
 
-          <Card className="border-slate-200 shadow-sm">
-            <CardHeader className="pb-4">
-              <CardTitle className="text-lg font-semibold text-slate-800">Стать клієнтів</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="relative h-[280px] w-full">
-                {genderData.length > 0 ? (
-                  <>
-                    <ResponsiveContainer width="100%" height="100%">
-                      <PieChart>
-                        <Pie
-                          data={genderData}
-                          dataKey="count"
-                          nameKey="label"
-                          innerRadius={70}
-                          outerRadius={100}
-                          paddingAngle={3}
-                        >
-                          {genderData.map((entry, index) => (
-                            <Cell key={entry.label} fill={PIE_COLORS[index % PIE_COLORS.length]} />
-                          ))}
-                        </Pie>
-                        <Tooltip
-                          contentStyle={{
-                            borderRadius: "8px",
-                            border: "none",
-                            boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)",
-                          }}
-                        />
-                      </PieChart>
-                    </ResponsiveContainer>
-                    <div className="absolute bottom-0 flex w-full justify-center gap-4 text-sm">
-                      {genderData.map((item, index) => (
-                        <div key={item.label} className="flex items-center gap-1.5">
-                          <span
-                            className="h-3 w-3 rounded-full"
-                            style={{ backgroundColor: PIE_COLORS[index % PIE_COLORS.length] }}
+              <Card className="border-[#d7cdc1] bg-white shadow-sm transition-shadow hover:shadow-md">
+                <CardContent className="flex items-center gap-3 p-4">
+                  <div className="rounded-xl bg-emerald-50 p-2.5 text-emerald-600">
+                    <Clock size={20} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-[#846851]">Сер. час перебування</p>
+                    <div className="text-2xl font-bold text-[#411e03]">{summary?.avg_time?.value || "0 хв 0 с"}</div>
+                    {summary?.avg_time?.trend && (
+                      <div
+                        className={`mt-1.5 flex items-center gap-1 text-sm font-medium ${
+                          summary.avg_time.is_positive ? "text-[#8a895f]" : "text-red-500/80"
+                        }`}
+                      >
+                        {summary.avg_time.is_positive ? <TrendingUp size={16} /> : <TrendingDown size={16} />}
+                        <span>{summary.avg_time.trend}%</span>
+                        <span className="ml-1 font-normal text-[#846851]">від учора</span>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="border-[#d7cdc1] bg-white shadow-sm transition-shadow hover:shadow-md">
+                <CardContent className="flex items-center gap-3 p-4">
+                  <div className="rounded-xl bg-amber-50 p-2.5 text-amber-600">
+                    <Zap size={20} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-[#846851]">Година пік</p>
+                    <div className="text-2xl font-bold text-[#411e03]">{summary?.peak_hour?.value || "Unknown"}</div>
+                    <div className="mt-1.5 text-sm text-[#846851]">{summary?.peak_hour?.subtext || ""}</div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+              <Card className="border-[#d7cdc1] bg-white shadow-sm lg:col-span-2">
+                <CardHeader className="p-5 pb-4">
+                  <CardTitle className="flex items-center gap-2 text-lg font-semibold text-[#411e03]">
+                    <MapPinned size={18} className="text-rose-500" />
+                    Теплова карта перебування
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="px-5 pb-5 pt-0">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) {
+                        void handleFileUpload(file);
+                      }
+                      event.target.value = "";
+                    }}
+                  />
+                  {myCafe?.floor_plan_url ? (
+                    <div className="relative mx-auto flex h-[500px] w-full max-w-[800px] items-center justify-center overflow-hidden rounded-lg bg-white shadow-inner">
+                      <AnalyticsHeatmap floorPlanUrl={myCafe.floor_plan_url} points={heatmapPoints} />
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="absolute top-3 right-3 rounded-md bg-white/90 px-3 py-1.5 text-xs font-medium text-[#411e03] shadow-sm transition hover:bg-white"
+                      >
+                        {isUploadingPlan ? "Завантаження..." : "Змінити план"}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="mx-auto flex h-[500px] w-full max-w-[800px] flex-col items-center justify-center rounded-lg border-2 border-dashed border-slate-300 bg-white px-6 text-center transition hover:bg-[#fdfdfd]"
+                    >
+                      <span className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-[#f5f3f0] text-3xl text-[#846851]">
+                        +
+                      </span>
+                      <span className="text-base font-semibold text-[#411e03]">Завантажити план приміщення</span>
+                      <span className="mt-2 text-sm text-[#846851]">
+                        {isUploadingPlan ? "Завантаження..." : "Додайте floor plan для вашого кафе"}
+                      </span>
+                    </button>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="border-[#d7cdc1] bg-white shadow-sm lg:col-span-1">
+                <CardHeader className="p-5 pb-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-bold text-[#411e03]">Статистика по зонах</h3>
+                    <Info size={16} className="cursor-help text-[#846851]/60" />
+                  </div>
+                </CardHeader>
+                <CardContent className="px-5 pb-5 pt-0">
+                  <div className="mb-4 grid grid-cols-[1fr_auto_auto_40px] gap-4 border-b border-[#d7cdc1]/30 pb-2 text-xs font-medium text-[#846851]">
+                    <div>Зона</div>
+                    <div className="text-center">Сер. час</div>
+                    <div className="text-right">К-сть</div>
+                    <div className="text-right">%</div>
+                  </div>
+
+                  <div className="space-y-4">
+                    {zoneData.map((zone, idx) => (
+                      <div key={idx} className="relative">
+                        <div className="relative z-10 mb-1 grid grid-cols-[1fr_auto_auto_40px] items-center gap-4 text-sm">
+                          <div className="flex items-center gap-2 font-medium text-[#411e03]">
+                            <div className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: zone.color }} />
+                            <span className="truncate">{zone.name}</span>
+                          </div>
+                          <div className="whitespace-nowrap text-center text-[#8a895f]">{zone.avg_time}</div>
+                          <div className="text-right font-medium text-[#411e03]">{zone.visits}</div>
+                          <div className="text-right text-xs text-[#846851]">{zone.percentage}%</div>
+                        </div>
+                        <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#f5f3f0]">
+                          <div
+                            className="h-full rounded-full transition-all duration-500 ease-out"
+                            style={{ width: `${zone.percentage}%`, backgroundColor: zone.color }}
                           />
-                          <span className="text-slate-600">{item.label}</span>
                         </div>
-                      ))}
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex h-full items-center justify-center text-sm text-slate-400">
-                    Немає даних про стать
-                  </div>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-          <Card className="border-slate-200 shadow-sm lg:col-span-2">
-            <CardHeader className="pb-4">
-              <CardTitle className="flex items-center gap-2 text-lg font-semibold text-slate-800">
-                <MapPinned size={18} className="text-rose-500" />
-                Теплова карта перебування
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <AnalyticsHeatmap floorPlanUrl={stats?.floor_plan_url} points={heatmapPoints} />
-            </CardContent>
-          </Card>
-
-          <Card className="border-slate-200 shadow-sm">
-            <CardHeader className="pb-4">
-              <CardTitle className="text-lg font-semibold text-slate-800">Аналіз зон</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {zoneStats.length > 0 ? (
-                <div className="space-y-4">
-                  {zoneStats.map((zone) => (
-                    <div key={zone.name} className="space-y-2 rounded-xl border border-slate-100 bg-slate-50 p-3">
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <p className="font-medium text-slate-800">{zone.name}</p>
-                          <p className="text-xs text-slate-500">Сер. час: {formatDuration(zone.avg_time_sec)}</p>
-                        </div>
-                        <span className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-slate-600">
-                          {zone.percent}%
-                        </span>
                       </div>
-                      <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-                        <div
-                          className="h-full rounded-full bg-gradient-to-r from-yellow-400 via-orange-500 to-red-500"
-                          style={{ width: `${Math.min(100, Math.max(0, zone.percent))}%` }}
-                        />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="flex h-[320px] items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50 text-sm text-slate-400">
-                  Немає даних по зонах для цього фільтра.
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-          <Card className="border-slate-200 shadow-sm">
-            <CardHeader className="pb-4">
-              <CardTitle className="text-lg font-semibold text-slate-800">Вікові групи</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="h-[250px] w-full">
-                {ageData.length > 0 ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={ageData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
-                      <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
-                      <XAxis
-                        dataKey="label"
-                        axisLine={false}
-                        tickLine={false}
-                        tick={{ fill: "#64748b", fontSize: 12 }}
-                        dy={10}
-                      />
-                      <YAxis
-                        allowDecimals={false}
-                        axisLine={false}
-                        tickLine={false}
-                        tick={{ fill: "#64748b", fontSize: 12 }}
-                      />
-                      <Tooltip
-                        cursor={{ fill: "#f1f5f9" }}
-                        contentStyle={{
-                          borderRadius: "8px",
-                          border: "none",
-                          boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)",
-                        }}
-                      />
-                      <Bar dataKey="count" name="Кількість" fill="#3b82f6" radius={[4, 4, 0, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <div className="flex h-full items-center justify-center text-sm text-slate-400">
-                    Немає даних про вік
+                    ))}
                   </div>
-                )}
-              </div>
-            </CardContent>
-          </Card>
 
-          <Card className="border-slate-200 shadow-sm lg:col-span-2">
-            <CardHeader className="border-b border-slate-100 pb-4">
-              <CardTitle className="text-lg font-semibold text-slate-800">Детальна статистика по датах</CardTitle>
-            </CardHeader>
-            <CardContent className="p-0">
-              {byDateEntries.length > 0 ? (
+                  <button className="mt-6 flex items-center gap-1 text-sm font-bold text-[#8a895f] transition-colors hover:text-[#411e03]">
+                    Детальніше про зони &rarr;
+                  </button>
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+              <Card className="border-[#d7cdc1] bg-white shadow-sm lg:col-span-2">
+                <CardHeader className="flex flex-col gap-4 p-5 pb-4 sm:flex-row sm:items-center sm:justify-between">
+                  <CardTitle className="flex items-center gap-2 text-lg font-semibold text-[#411e03]">
+                    <TrendingUp size={18} className="text-emerald-500" />
+                    Динаміка відвідуваності
+                  </CardTitle>
+                  <Tabs
+                    value={dynamicsView}
+                    onValueChange={(value) => setDynamicsView(value as "hours" | "days")}
+                    className="w-auto"
+                  >
+                    <TabsList className="h-9 border border-[#d7cdc1] bg-[#f5f3f0] shadow-sm">
+                      <TabsTrigger value="hours" className="text-[#846851] data-[state=active]:bg-[#411e03] data-[state=active]:text-white">
+                        Години
+                      </TabsTrigger>
+                      <TabsTrigger value="days" className="text-[#846851] data-[state=active]:bg-[#411e03] data-[state=active]:text-white">
+                        Дні
+                      </TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                </CardHeader>
+                <CardContent className="px-5 pb-5 pt-0">
+                  <div className="h-64 min-h-[256px] w-full">
+                    {dynamicsData.length > 0 ? (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={dynamicsData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                          <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
+                          <XAxis
+                            dataKey={dynamicsXAxisKey}
+                            axisLine={false}
+                            tickLine={false}
+                            tick={{ fill: "#64748b", fontSize: 12 }}
+                            dy={10}
+                          />
+                          <YAxis axisLine={false} tickLine={false} tick={{ fill: "#64748b", fontSize: 12 }} />
+                          <Tooltip
+                            contentStyle={{
+                              borderRadius: "8px",
+                              border: "none",
+                              boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)",
+                            }}
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="customers"
+                            name="Клієнти"
+                            stroke="#10b981"
+                            strokeWidth={3}
+                            dot={{ r: 4, fill: "#10b981", strokeWidth: 2 }}
+                            activeDot={{ r: 6 }}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex h-full items-center justify-center text-sm text-slate-400">
+                        Немає даних для графіка
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="border-[#d7cdc1] bg-white shadow-sm lg:col-span-1">
+                <CardHeader className="p-5 pb-4">
+                  <CardTitle className="text-lg font-semibold text-[#411e03]">Розподіл за віком і статтю</CardTitle>
+                </CardHeader>
+                <CardContent className="px-5 pb-5 pt-0">
+                  <div className="h-64 min-h-[256px] w-full">
+                    {demographics.length > 0 ? (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={demographics} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
+                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
+                          <XAxis
+                            dataKey="age_group"
+                            axisLine={false}
+                            tickLine={false}
+                            tick={{ fill: "#846851", fontSize: 12 }}
+                            dy={10}
+                          />
+                          <YAxis axisLine={false} tickLine={false} tick={{ fill: "#846851", fontSize: 12 }} />
+                          <Tooltip
+                            cursor={{ fill: "#f8fafc" }}
+                            contentStyle={{
+                              borderRadius: "8px",
+                              border: "1px solid #d7cdc1",
+                              boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)",
+                            }}
+                          />
+                          <Legend
+                            iconType="circle"
+                            wrapperStyle={{ paddingTop: "20px", fontSize: "12px", color: "#411e03" }}
+                          />
+                          <Bar dataKey="Чоловіки" fill="#8a895f" radius={[4, 4, 0, 0]} barSize={12} />
+                          <Bar dataKey="Жінки" fill="#846851" radius={[4, 4, 0, 0]} barSize={12} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex h-full items-center justify-center text-sm text-slate-400">
+                        Немає демографічних даних
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+              <Card className="overflow-hidden border-[#d7cdc1] bg-white shadow-sm lg:col-span-2">
+                <div className="flex items-center justify-between border-b border-[#d7cdc1]/50 p-5">
+                  <h3 className="text-lg font-bold text-[#411e03]">Статистика по датах</h3>
+                </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-sm">
-                    <thead className="border-b border-slate-100 bg-slate-50/50 font-medium text-slate-500">
+                    <thead className="bg-[#f5f3f0] font-medium text-[#846851]">
                       <tr>
-                        <th className="px-4 py-3">Дата</th>
-                        <th className="px-4 py-3 text-center">Клієнти</th>
-                        <th className="px-4 py-3">Сер. час</th>
-                        <th className="px-4 py-3">Година пік</th>
-                        <th className="px-4 py-3">Стать</th>
+                        <th className="rounded-tl-lg px-6 py-4">Дата</th>
+                        <th className="px-6 py-4">Всього клієнтів</th>
+                        <th className="px-6 py-4">Сер. час</th>
+                        <th className="px-6 py-4">Година пік</th>
+                        <th className="px-6 py-4">Стать</th>
+                        <th className="rounded-tr-lg px-6 py-4">Осн. вікова група</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {byDateEntries.map(([entryDate, group]) => (
-                        <tr key={entryDate} className="transition-colors hover:bg-slate-50/50">
-                          <td className="px-4 py-3 font-medium text-slate-900">{entryDate}</td>
-                          <td className="px-4 py-3 text-center">
-                            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-bold text-slate-700">
-                              {group.total_customers}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 text-slate-600">{formatDuration(group.average_duration_sec)}</td>
-                          <td className="px-4 py-3 text-slate-600">{group.peak_hour ?? "—"}</td>
-                          <td className="px-4 py-3 text-xs text-slate-600">
-                            {formatBreakdown(group.gender_distribution, {
-                              Male: "Ч",
-                              Female: "Ж",
-                              "Unknown / other": "Інше",
-                            })}
-                          </td>
+                    <tbody className="divide-y divide-[#d7cdc1]/30">
+                      {historyData.map((row, idx) => (
+                        <tr key={idx} className="text-[#411e03] transition-colors hover:bg-slate-50">
+                          <td className="px-6 py-4 font-medium">{row.date}</td>
+                          <td className="px-6 py-4">{row.total}</td>
+                          <td className="px-6 py-4 text-[#8a895f]">{row.avg_time}</td>
+                          <td className="px-6 py-4">{row.peak}</td>
+                          <td className="px-6 py-4">{row.gender}</td>
+                          <td className="px-6 py-4">{row.top_age}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
-              ) : (
-                <div className="p-8 text-center text-sm text-slate-400">
-                  Ще немає збережених записів по датах.
+                <div className="border-t border-[#d7cdc1]/50 bg-white p-4">
+                  <button className="flex items-center gap-1 text-sm font-bold text-[#8a895f] transition-colors hover:text-[#411e03]">
+                    Переглянути повну історію &rarr;
+                  </button>
                 </div>
-              )}
-            </CardContent>
-          </Card>
+              </Card>
+
+              <Card className="border-[#d7cdc1] bg-white shadow-sm lg:col-span-1">
+                <CardHeader className="p-5 pb-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-bold text-[#411e03]">Найпопулярніші маршрути</h3>
+                    <Info size={16} className="cursor-help text-[#846851]/60" />
+                  </div>
+                </CardHeader>
+                <CardContent className="px-5 pb-5 pt-0">
+                  <div className="space-y-6">
+                    {routesData.map((route, idx) => (
+                      <div key={idx} className="group">
+                        <div className="mb-2 flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <span className="flex h-6 w-6 items-center justify-center rounded-full border border-[#d7cdc1] bg-[#f5f3f0] text-xs font-bold text-[#411e03]">
+                              {idx + 1}
+                            </span>
+                            <p className="text-sm font-medium text-[#411e03] transition-colors group-hover:text-[#8a895f]">
+                              {route.path}
+                            </p>
+                          </div>
+                          <span className="text-sm font-bold text-[#411e03]">{route.percentage}%</span>
+                        </div>
+                        <div className="ml-9 h-1.5 w-full overflow-hidden rounded-full bg-[#f5f3f0]">
+                          <div
+                            className="h-full rounded-full bg-[#8a895f] transition-all duration-700 ease-out"
+                            style={{ width: `${route.percentage}%` }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <button className="mt-8 flex items-center gap-1 text-sm font-bold text-[#8a895f] transition-colors hover:text-[#411e03]">
+                    Детальніше про маршрути &rarr;
+                  </button>
+                </CardContent>
+              </Card>
+            </div>
+          </div>
         </div>
       </div>
     </div>

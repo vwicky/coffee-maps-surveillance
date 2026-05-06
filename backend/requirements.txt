@@ -21,6 +21,8 @@ transformers==4.56.1
 pandas==2.3.2
 Pillow==11.3.0
 pymongo==4.15.0
+PyJWT
+passlib[bcrypt]
 python-dotenv==1.1.1
 matplotlib==3.7.1
 
