@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -79,9 +79,13 @@ LIVE_SESSION_SNAPSHOTS_DIR = SNAPSHOTS_DIR / "live_current"
 LIVE_SESSION_ARCHIVE_DIR = SNAPSHOTS_DIR / "processed_sessions"
 live_session_lock = threading.Lock()
 active_streams: dict[str, int] = {}
+# Filenames currently generating MJPEG in ``generate_yolo_frames`` (per cafe).
+streaming_filenames: defaultdict[str, set[str]] = defaultdict(set)
 session_finalization_requested: dict[str, bool] = {}
 live_session_track_times: dict[str, dict[int, dict[str, object]]] = {}
 POSITION_SAMPLE_INTERVAL_SEC = 1.0
+# Expand zone rectangles when serving zones to clients / classification (seating around furniture).
+ZONE_PADDING = 25
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production-coffee-maps-auth-secret")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
@@ -342,16 +346,39 @@ def _load_floor_plan_map_zones(cafe_id: str) -> list[dict[str, object]]:
     ]
 
 
+def _expand_zone_bounds_for_seating(zones: list[dict[str, object]], pad: int = ZONE_PADDING) -> list[dict[str, object]]:
+    """Return a copy of zones with x/y bounds expanded by ``pad`` px (mins floored at 0)."""
+    if pad <= 0:
+        return [dict(z) for z in zones]
+    expanded: list[dict[str, object]] = []
+    for z in zones:
+        try:
+            xm = int(float(z["xMin"]))
+            xM = int(float(z["xMax"]))
+            ym = int(float(z["yMin"]))
+            yM = int(float(z["yMax"]))
+        except (KeyError, TypeError, ValueError):
+            expanded.append(dict(z))
+            continue
+        nz = dict(z)
+        nz["xMin"] = max(0, xm - pad)
+        nz["yMin"] = max(0, ym - pad)
+        nz["xMax"] = xM + pad
+        nz["yMax"] = yM + pad
+        expanded.append(nz)
+    return expanded
+
+
 def _resolve_zone_name(x: int | float | None, y: int | float | None, zones: list[dict[str, object]]) -> str:
     if x is None or y is None:
         return ""
 
+    px = float(x)
+    py = float(y)
+
     for zone in zones:
         try:
-            if (
-                float(zone["xMin"]) <= float(x) <= float(zone["xMax"])
-                and float(zone["yMin"]) <= float(y) <= float(zone["yMax"])
-            ):
+            if float(zone["xMin"]) <= px <= float(zone["xMax"]) and float(zone["yMin"]) <= py <= float(zone["yMax"]):
                 return str(zone.get("name", "") or "")
         except (KeyError, TypeError, ValueError):
             continue
@@ -578,6 +605,257 @@ def _matches_stats_filters(
         if record_time < start_time_value or record_time > end_time_value:
             return False
     return True
+
+
+def _face_duration_sec(face: dict) -> float:
+    meta = face.get("additional_metadata", {}) or {}
+    raw = face.get("total_duration_sec")
+    if raw is None:
+        raw = meta.get("duration_sec")
+    try:
+        return max(0.0, float(raw or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_query_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _parse_query_time_range_param(time_range: str | None):
+    if not time_range or "-" not in time_range:
+        return None, None
+    try:
+        raw_start, raw_end = [part.strip() for part in time_range.split("-", 1)]
+        return (
+            datetime.strptime(raw_start, "%H:%M").time(),
+            datetime.strptime(raw_end, "%H:%M").time(),
+        )
+    except ValueError:
+        return None, None
+
+
+def _percent_change(current: float, previous: float) -> float | None:
+    if previous == 0:
+        return None
+    return round(((current - previous) / previous) * 100, 1)
+
+
+def _aggregate_visitor_faces_for_period(
+    sessions: list[dict],
+    *,
+    period_start: date | None,
+    period_end: date | None,
+    start_time_value,
+    end_time_value,
+) -> tuple[int, float, str | None, int | None]:
+    hour_counts: dict[int, int] = {}
+    durations: list[float] = []
+
+    for session in sessions:
+        faces = session.get("faces", [])
+        if not isinstance(faces, list):
+            continue
+
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+
+            additional_metadata = face.get("additional_metadata", {}) or {}
+            if bool(additional_metadata.get("is_staff", False)):
+                continue
+
+            enter_dt = _parse_sample_timestamp(str(additional_metadata.get("enter_time", "") or "").strip())
+            if enter_dt is None:
+                continue
+
+            d = enter_dt.date()
+            if period_start is not None and period_end is not None:
+                if d < period_start or d > period_end:
+                    continue
+            elif period_start is not None or period_end is not None:
+                continue
+
+            if start_time_value is not None and end_time_value is not None:
+                record_time = enter_dt.time()
+                if record_time < start_time_value or record_time > end_time_value:
+                    continue
+
+            durations.append(_face_duration_sec(face))
+            hour_counts[enter_dt.hour] = hour_counts.get(enter_dt.hour, 0) + 1
+
+    n = len(durations)
+    avg_sec = (sum(durations) / n) if n > 0 else 0.0
+    peak_hour = None
+    peak_clients = None
+    if hour_counts:
+        best_hour, best_count = max(hour_counts.items(), key=lambda item: item[1])
+        peak_hour = f"{best_hour:02d}:00"
+        peak_clients = int(best_count)
+
+    return n, avg_sec, peak_hour, peak_clients
+
+
+def _require_analytics_period_or_all(
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> tuple[date | None, date | None]:
+    d_start = _parse_query_date(start_date)
+    d_end = _parse_query_date(end_date)
+    if (d_start is None) ^ (d_end is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Надайте обидві дати start_date та end_date або жодної.",
+        )
+    if d_start is not None and d_end is not None and d_end < d_start:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="end_date не може бути раніше за start_date.",
+        )
+    return d_start, d_end
+
+
+def _sessions_for_cafe(cafe_id: str) -> list[dict]:
+    """Load session documents for one cafe (multi-tenant isolation)."""
+    return list(sessions_collection.find({"cafe_id": cafe_id}, {"_id": 0, "faces": 1}))
+
+
+def _visitor_face_rows(
+    sessions: list[dict],
+    *,
+    period_start: date | None,
+    period_end: date | None,
+    start_time_value,
+    end_time_value,
+) -> list[dict[str, object]]:
+    """One row per visitor (face) with visit day/hour and demographics. Uses enter_time on each face."""
+    rows: list[dict[str, object]] = []
+    for session in sessions:
+        faces = session.get("faces", [])
+        if not isinstance(faces, list):
+            continue
+
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+
+            additional_metadata = face.get("additional_metadata", {}) or {}
+            if bool(additional_metadata.get("is_staff", False)):
+                continue
+
+            enter_dt = _parse_sample_timestamp(str(additional_metadata.get("enter_time", "") or "").strip())
+            if enter_dt is None:
+                continue
+
+            d = enter_dt.date()
+            if period_start is not None and period_end is not None:
+                if d < period_start or d > period_end:
+                    continue
+            elif period_start is not None or period_end is not None:
+                continue
+
+            if start_time_value is not None and end_time_value is not None:
+                record_time = enter_dt.time()
+                if record_time < start_time_value or record_time > end_time_value:
+                    continue
+
+            clf = face.get("classification_result", {}) or {}
+            rows.append(
+                {
+                    "day": d,
+                    "hour": enter_dt.hour,
+                    "duration_sec": _face_duration_sec(face),
+                    "age": clf.get("age"),
+                    "sex": clf.get("sex"),
+                }
+            )
+    return rows
+
+
+def _analytics_dynamics_series(
+    rows: list[dict[str, object]],
+    *,
+    view: str,
+) -> list[dict[str, object]]:
+    if view == "days":
+        counts: defaultdict[date, int] = defaultdict(int)
+        for r in rows:
+            counts[r["day"]] += 1  # type: ignore[index]
+        return [
+            {"date": f"{d.day:02d}-{d.month:02d}", "customers": counts[d]} for d in sorted(counts.keys())
+        ]
+
+    counts_h = [0] * 24
+    for r in rows:
+        h = int(r["hour"])  # type: ignore[arg-type]
+        counts_h[h] += 1
+    return [{"time": f"{h:02d}:00", "customers": counts_h[h]} for h in range(24)]
+
+
+def _analytics_demographics_from_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    age_order = ["0-17", "18-25", "26-35", "36-45", "46-55", "56+"]
+    buckets = {ag: {"Чоловіки": 0, "Жінки": 0} for ag in age_order}
+    for r in rows:
+        ag = _age_bucket_from_value(r.get("age"))
+        if ag not in buckets:
+            continue
+        gl = _normalize_gender_label(r.get("sex"))
+        if gl == "Male":
+            buckets[ag]["Чоловіки"] += 1
+        elif gl == "Female":
+            buckets[ag]["Жінки"] += 1
+    return [{"age_group": ag, **buckets[ag]} for ag in age_order]
+
+
+def _analytics_daily_table(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    by_day: defaultdict[date, list[dict[str, object]]] = defaultdict(list)
+    for r in rows:
+        by_day[r["day"]].append(r)  # type: ignore[index]
+
+    ordered_days = sorted(by_day.keys(), reverse=True)[:120]
+    out: list[dict[str, object]] = []
+    for d in ordered_days:
+        day_rows = by_day[d]
+        total = len(day_rows)
+        avg_sec = sum(float(r["duration_sec"]) for r in day_rows) / total if total else 0.0
+        hour_counts: defaultdict[int, int] = defaultdict(int)
+        for r in day_rows:
+            hour_counts[int(r["hour"])] += 1
+        peak_str = "—"
+        if hour_counts:
+            peak_h = max(hour_counts.items(), key=lambda item: item[1])[0]
+            peak_str = f"{peak_h:02d}:00"
+
+        m_count = f_count = 0
+        age_counts: defaultdict[str, int] = defaultdict(int)
+        for r in day_rows:
+            gl = _normalize_gender_label(r.get("sex"))
+            if gl == "Male":
+                m_count += 1
+            elif gl == "Female":
+                f_count += 1
+            age_counts[_age_bucket_from_value(r.get("age"))] += 1
+
+        top_age = "—"
+        if age_counts:
+            top_age = max(age_counts.items(), key=lambda item: item[1])[0]
+
+        out.append(
+            {
+                "date": d.isoformat(),
+                "total": total,
+                "avg_time": _format_duration_label(avg_sec),
+                "peak": peak_str,
+                "gender": f"Ч: {m_count}, Ж: {f_count}",
+                "top_age": top_age,
+            }
+        )
+    return out
 
 
 def _build_buffered_zone(
@@ -1163,7 +1441,7 @@ def generate_yolo_frames(video_path, filename, cafe_id: str, camera_id=None):
     processed_customer_ids = set()
     track_zone_stats = {}
     cafe_track_times = live_session_track_times.setdefault(str(cafe_id), {})
-    analytics_zones = _load_floor_plan_map_zones(cafe_id)
+    analytics_zones = _expand_zone_bounds_for_seating(_load_floor_plan_map_zones(cafe_id))
     last_zone_refresh_monotonic = time.monotonic()
     homography_status_logged = False
     logger.info("Opening video source: %s", video_path)
@@ -1193,13 +1471,15 @@ def generate_yolo_frames(video_path, filename, cafe_id: str, camera_id=None):
     )
 
     try:
+        with live_session_lock:
+            streaming_filenames[str(cafe_id)].add(filename)
         for r in results_generator:
             annotated_frame = r.orig_img.copy()
             projected_points: list[dict[str, object]] = []
             try:
                 now_monotonic = time.monotonic()
                 if now_monotonic - last_zone_refresh_monotonic >= 2.0:
-                    analytics_zones = _load_floor_plan_map_zones(cafe_id)
+                    analytics_zones = _expand_zone_bounds_for_seating(_load_floor_plan_map_zones(cafe_id))
                     last_zone_refresh_monotonic = now_monotonic
                 current_time = datetime.now()
                 height, width = annotated_frame.shape[:2]
@@ -1430,6 +1710,7 @@ def generate_yolo_frames(video_path, filename, cafe_id: str, camera_id=None):
     finally:
         current_occupancy.setdefault(str(cafe_id), {})[filename] = []
         with live_session_lock:
+            streaming_filenames[str(cafe_id)].discard(filename)
             _ensure_live_session_dirs(cafe_id)
             _write_live_people_times_csv(
                 _get_cafe_live_snapshots_dir(cafe_id) / "people_times.csv",
@@ -1510,28 +1791,45 @@ async def read_my_cafe(current_user=Depends(get_current_user)):
     }
 
 
+async def _save_cafe_floor_plan_upload(user_cafe: dict, file: UploadFile) -> str:
+    """Persist a new floor-plan file with a unique name (cache bust) and store a relative URL."""
+    cafe_id = str(user_cafe["_id"])
+    raw_name = file.filename or "plan.png"
+    ext = raw_name.split(".")[-1].lower() if "." in raw_name else "png"
+    if not ext.isalnum() or len(ext) > 8:
+        ext = "png"
+    new_filename = f"cafe_{cafe_id}_plan_{uuid4().hex[:8]}.{ext}"
+    dest = CAFE_UPLOADS_DIR / new_filename
+
+    with dest.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    await file.close()
+
+    new_url = f"/uploads/{new_filename}"
+    cafes_collection.update_one(
+        {"_id": user_cafe["_id"]},
+        {"$set": {"floor_plan_url": new_url}},
+    )
+    return new_url
+
+
+@app.post("/api/cafe/update-floor-plan")
+async def update_cafe_floor_plan(file: UploadFile = File(...), current_user=Depends(get_current_user)):
+    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
+    if not user_cafe:
+        raise HTTPException(status_code=404, detail="Cafe not found")
+    new_url = await _save_cafe_floor_plan_upload(user_cafe, file)
+    return {"message": "Plan updated", "floor_plan_url": new_url}
+
+
 @app.post("/api/cafes/me/floor-plan")
 async def upload_my_cafe_floor_plan(file: UploadFile = File(...), current_user=Depends(get_current_user)):
     user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
     if not user_cafe:
         raise HTTPException(status_code=404, detail="Cafe not found")
 
-    file_extension = Path(file.filename or "").suffix.lower() or ".png"
-    filename = f"cafe_{user_cafe['_id']}_plan{file_extension}"
-    file_path = CAFE_UPLOADS_DIR / filename
-
-    with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    await file.close()
-
-    file_url = f"http://127.0.0.1:8000/uploads/{filename}"
-    cafes_collection.update_one(
-        {"_id": user_cafe["_id"]},
-        {"$set": {"floor_plan_url": file_url}},
-    )
-
-    return {"floor_plan_url": file_url}
+    new_url = await _save_cafe_floor_plan_upload(user_cafe, file)
+    return {"floor_plan_url": new_url, "message": "Plan updated"}
 
 
 @app.post("/set_zone/{filename}")
@@ -1546,14 +1844,14 @@ async def set_zone(filename: str, request: Request, current_user=Depends(get_cur
 @app.get("/api/floor_plan/zones")
 async def get_floor_plan_zones(current_user=Depends(get_current_user)):
     user_cafe = _get_cafe_for_user(current_user)
-    return {"zones": _load_floor_plan_map_zones(str(user_cafe["_id"]))}
+    return {"zones": _expand_zone_bounds_for_seating(_load_floor_plan_map_zones(str(user_cafe["_id"])))}
 
 
 @app.post("/api/floor_plan/zones")
 async def save_floor_plan_zones(payload: list[FloorPlanZone], current_user=Depends(get_current_user)):
     user_cafe = _get_cafe_for_user(current_user)
     saved_zones = _save_floor_plan_map_zones(str(user_cafe["_id"]), [zone.model_dump() for zone in payload])
-    return {"status": "success", "zones": saved_zones}
+    return {"status": "success", "zones": _expand_zone_bounds_for_seating(saved_zones)}
 
 
 @app.post("/api/analyze_floor_plan")
@@ -1634,6 +1932,31 @@ async def upload_video(
         "stream_url": stream_url,
         "thumbnail_url": thumbnail_url,
     }
+
+
+@app.get("/api/live_video_streams")
+async def live_video_streams(current_user=Depends(get_current_user)):
+    """Filenames whose YOLO/MJPEG pipeline is still running for this cafe."""
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+    with live_session_lock:
+        active = sorted(streaming_filenames[cafe_id])
+    return {"active_filenames": active}
+
+
+@app.get("/api/video_source/{filename}")
+async def api_video_source(filename: str, token: str = ""):
+    """Serve uploaded source video for <video> playback (token query, same pattern as video_feed)."""
+    current_user = _get_user_from_token(token)
+    if current_user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    user_cafe = _get_cafe_for_user(current_user)
+    _ = user_cafe
+    safe_name = os.path.basename(filename)
+    path = UPLOAD_DIR / safe_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Video not found")
+    return FileResponse(path)
 
 
 @app.post("/api/end_session")
@@ -1839,207 +2162,136 @@ async def get_stats(
 
 
 @app.get("/api/analytics/summary")
-async def get_analytics_summary(current_user=Depends(get_current_user)):
+async def get_analytics_summary(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    time_range: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
     user_cafe = _get_cafe_for_user(current_user)
     cafe_id = str(user_cafe["_id"])
 
-    summary_pipeline = [
-        {"$match": {"cafe_id": cafe_id}},
-        {"$unwind": "$faces"},
-        {
-            "$project": {
-                "duration_sec": {
-                    "$convert": {
-                        "input": {
-                            "$ifNull": [
-                                "$faces.total_duration_sec",
-                                "$faces.additional_metadata.duration_sec",
-                            ]
-                        },
-                        "to": "double",
-                        "onError": 0,
-                        "onNull": 0,
-                    }
-                }
-            }
-        },
-        {
-            "$group": {
-                "_id": None,
-                "total_customers": {"$sum": 1},
-                "average_duration_sec": {"$avg": "$duration_sec"},
-            }
-        },
-    ]
+    period_start, period_end = _require_analytics_period_or_all(start_date, end_date)
+    start_time_value, end_time_value = _parse_query_time_range_param(time_range)
 
-    summary_result = list(sessions_collection.aggregate(summary_pipeline))
-    summary = summary_result[0] if summary_result else {}
-    total_customers = int(summary.get("total_customers", 0) or 0)
-    average_duration_sec = float(summary.get("average_duration_sec", 0) or 0)
+    sessions = _sessions_for_cafe(cafe_id)
+
+    cur_n, cur_avg, peak_hour, peak_clients = _aggregate_visitor_faces_for_period(
+        sessions,
+        period_start=period_start,
+        period_end=period_end,
+        start_time_value=start_time_value,
+        end_time_value=end_time_value,
+    )
+
+    clients_trend: float | None = None
+    duration_trend: float | None = None
+
+    if period_start is not None and period_end is not None:
+        span_days = (period_end - period_start).days + 1
+        prev_end = period_start - timedelta(days=1)
+        prev_start = prev_end - timedelta(days=span_days - 1)
+        prev_n, prev_avg, _, _ = _aggregate_visitor_faces_for_period(
+            sessions,
+            period_start=prev_start,
+            period_end=prev_end,
+            start_time_value=start_time_value,
+            end_time_value=end_time_value,
+        )
+        clients_trend = _percent_change(float(cur_n), float(prev_n))
+        duration_trend = _percent_change(cur_avg, prev_avg)
 
     return {
-        "total_customers": {"value": total_customers, "trend": 12.5, "is_positive": True},
-        "avg_time": {"value": _format_duration_label(average_duration_sec), "trend": 8.3, "is_positive": True},
-        "peak_hour": {"value": "16:00", "subtext": "119 клієнтів"},
+        "total_clients": int(cur_n),
+        "clients_trend": clients_trend,
+        "avg_duration_seconds": round(cur_avg, 2),
+        "duration_trend": duration_trend,
+        "peak_hour": peak_hour,
+        "peak_clients": peak_clients,
     }
 
 
 @app.get("/api/analytics/dynamics")
-async def get_analytics_dynamics(view: str = "hours", current_user=Depends(get_current_user)):
-    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
-    if not user_cafe:
-        raise HTTPException(status_code=404, detail="Cafe not found")
-
-    if view == "days":
-        return [
-            {"date": "01-05", "customers": 88},
-            {"date": "02-05", "customers": 96},
-            {"date": "03-05", "customers": 115},
-            {"date": "04-05", "customers": 98},
-            {"date": "05-05", "customers": 129},
-            {"date": "06-05", "customers": 142},
-        ]
-
-    return [
-        {"time": "08:00", "customers": 12},
-        {"time": "10:00", "customers": 26},
-        {"time": "12:00", "customers": 48},
-        {"time": "14:00", "customers": 57},
-        {"time": "16:00", "customers": 73},
-        {"time": "18:00", "customers": 52},
-        {"time": "20:00", "customers": 31},
-    ]
+async def get_analytics_dynamics(
+    view: str = "hours",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    time_range: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """
+    Visit dynamics for the authenticated owner's cafe only.
+    Sessions store per-face enter_time (not a top-level session timestamp); filtering uses that datetime.
+    """
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+    period_start, period_end = _require_analytics_period_or_all(start_date, end_date)
+    st_t, en_t = _parse_query_time_range_param(time_range)
+    sessions = _sessions_for_cafe(cafe_id)
+    rows = _visitor_face_rows(
+        sessions,
+        period_start=period_start,
+        period_end=period_end,
+        start_time_value=st_t,
+        end_time_value=en_t,
+    )
+    safe_view = "days" if view == "days" else "hours"
+    return _analytics_dynamics_series(rows, view=safe_view)
 
 
 @app.get("/api/analytics/demographics")
-async def get_analytics_demographics(current_user=Depends(get_current_user)):
+async def get_analytics_demographics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    time_range: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
     user_cafe = _get_cafe_for_user(current_user)
     cafe_id = str(user_cafe["_id"])
-    age_order = ["0-17", "18-25", "26-35", "36-45", "46-55", "56+"]
-
-    demographics_pipeline = [
-        {"$match": {"cafe_id": cafe_id}},
-        {"$unwind": "$faces"},
-        {
-            "$project": {
-                "age_value": {
-                    "$convert": {
-                        "input": "$faces.classification_result.age",
-                        "to": "int",
-                        "onError": -1,
-                        "onNull": -1,
-                    }
-                },
-                "sex_value": {"$toUpper": {"$ifNull": ["$faces.classification_result.sex", ""]}},
-            }
-        },
-        {
-            "$project": {
-                "age_group": {
-                    "$switch": {
-                        "branches": [
-                            {"case": {"$lte": ["$age_value", 17]}, "then": "0-17"},
-                            {
-                                "case": {
-                                    "$and": [
-                                        {"$gte": ["$age_value", 18]},
-                                        {"$lte": ["$age_value", 25]},
-                                    ]
-                                },
-                                "then": "18-25",
-                            },
-                            {
-                                "case": {
-                                    "$and": [
-                                        {"$gte": ["$age_value", 26]},
-                                        {"$lte": ["$age_value", 35]},
-                                    ]
-                                },
-                                "then": "26-35",
-                            },
-                            {
-                                "case": {
-                                    "$and": [
-                                        {"$gte": ["$age_value", 36]},
-                                        {"$lte": ["$age_value", 45]},
-                                    ]
-                                },
-                                "then": "36-45",
-                            },
-                            {
-                                "case": {
-                                    "$and": [
-                                        {"$gte": ["$age_value", 46]},
-                                        {"$lte": ["$age_value", 55]},
-                                    ]
-                                },
-                                "then": "46-55",
-                            },
-                            {"case": {"$gte": ["$age_value", 56]}, "then": "56+"},
-                        ],
-                        "default": "Unknown",
-                    }
-                },
-                "sex_normalized": {
-                    "$switch": {
-                        "branches": [
-                            {"case": {"$in": ["$sex_value", ["M", "MALE", "MAN"]]}, "then": "M"},
-                            {"case": {"$in": ["$sex_value", ["F", "FEMALE", "WOMAN"]]}, "then": "F"},
-                        ],
-                        "default": "",
-                    }
-                },
-            }
-        },
-        {"$match": {"age_group": {"$in": age_order}}},
-        {
-            "$group": {
-                "_id": "$age_group",
-                "Чоловіки": {
-                    "$sum": {
-                        "$cond": [{"$eq": ["$sex_normalized", "M"]}, 1, 0]
-                    }
-                },
-                "Жінки": {
-                    "$sum": {
-                        "$cond": [{"$eq": ["$sex_normalized", "F"]}, 1, 0]
-                    }
-                },
-            }
-        },
-    ]
-
-    raw_demographics = list(sessions_collection.aggregate(demographics_pipeline))
-    demographics_by_age = {
-        str(row.get("_id")): {
-            "Чоловіки": int(row.get("Чоловіки", 0) or 0),
-            "Жінки": int(row.get("Жінки", 0) or 0),
-        }
-        for row in raw_demographics
-    }
-
-    return [
-        {
-            "age_group": age_group,
-            "Чоловіки": demographics_by_age.get(age_group, {}).get("Чоловіки", 0),
-            "Жінки": demographics_by_age.get(age_group, {}).get("Жінки", 0),
-        }
-        for age_group in age_order
-    ]
+    period_start, period_end = _require_analytics_period_or_all(start_date, end_date)
+    st_t, en_t = _parse_query_time_range_param(time_range)
+    sessions = _sessions_for_cafe(cafe_id)
+    rows = _visitor_face_rows(
+        sessions,
+        period_start=period_start,
+        period_end=period_end,
+        start_time_value=st_t,
+        end_time_value=en_t,
+    )
+    return _analytics_demographics_from_rows(rows)
 
 
 @app.get("/api/analytics/history")
-async def get_analytics_history(current_user=Depends(get_current_user)):
-    user_cafe = cafes_collection.find_one({"owner_id": str(current_user["_id"])})
-    if not user_cafe:
-        raise HTTPException(status_code=404, detail="Cafe not found")
+async def get_analytics_history(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    time_range: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    user_cafe = _get_cafe_for_user(current_user)
+    cafe_id = str(user_cafe["_id"])
+    period_start, period_end = _require_analytics_period_or_all(start_date, end_date)
+    st_t, en_t = _parse_query_time_range_param(time_range)
+    sessions = _sessions_for_cafe(cafe_id)
+    rows = _visitor_face_rows(
+        sessions,
+        period_start=period_start,
+        period_end=period_end,
+        start_time_value=st_t,
+        end_time_value=en_t,
+    )
+    return _analytics_daily_table(rows)
 
-    return [
-        {"date": "2026-05-06", "total": 142, "avg_time": "1 хв 45 с", "peak": "16:00", "gender": "Ч: 65, Ж: 77", "top_age": "26-35"},
-        {"date": "2026-05-05", "total": 129, "avg_time": "1 хв 52 с", "peak": "15:00", "gender": "Ч: 56, Ж: 73", "top_age": "26-35"},
-        {"date": "2026-05-04", "total": 98, "avg_time": "2 хв 10 с", "peak": "13:00", "gender": "Ч: 40, Ж: 58", "top_age": "18-25"},
-        {"date": "2026-05-03", "total": 115, "avg_time": "1 хв 30 с", "peak": "18:00", "gender": "Ч: 50, Ж: 65", "top_age": "26-35"},
-    ]
+
+@app.get("/api/analytics/daily-stats")
+async def get_analytics_daily_stats(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    time_range: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Alias for /api/analytics/history — per-day aggregates for the cafe."""
+    return await get_analytics_history(start_date, end_date, time_range, current_user)
 
 
 @app.get("/api/analytics/zones")
@@ -2069,10 +2321,20 @@ async def get_analytics_zones(current_user=Depends(get_current_user)):
                 },
             }
         },
-        {"$match": {"zone_name": {"$nin": ["", None]}}},
+        {
+            "$addFields": {
+                "normalized_zone": {
+                    "$cond": [
+                        {"$eq": [{"$ifNull": ["$zone_name", ""]}, ""]},
+                        "В русі / Інше",
+                        "$zone_name",
+                    ]
+                }
+            }
+        },
         {
             "$group": {
-                "_id": "$zone_name",
+                "_id": "$normalized_zone",
                 "visits": {"$sum": 1},
                 "average_duration_sec": {"$avg": "$duration_sec"},
             }

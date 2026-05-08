@@ -1,7 +1,7 @@
 import { Card, CardContent } from "./components/ui/card";
 import { Button } from "./components/ui/button";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, LogOut, User } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ImageUp, LogOut, Play, Pause, Square, Store } from "lucide-react";
 import Analytics from "./pages/Analytics";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
@@ -24,7 +24,8 @@ interface Point {
 interface OccupancyPoint {
   x: number;
   y: number;
-  is_staff?: boolean;
+  is_staff?: boolean | string;
+  additional_metadata?: { is_staff?: boolean | string };
 }
 
 interface OccupancyHistoryPoint extends OccupancyPoint {
@@ -39,6 +40,28 @@ interface MapZone {
   yMin: number;
   yMax: number;
 }
+
+/** Must match backend ``ZONE_PADDING`` in ``backend/api/run_local.py``. */
+const ZONE_DISPLAY_PADDING_PX = 25;
+
+/** Brand palette — Live 2D Map person markers */
+const BRAND_COCOA = "#411e03";
+const BRAND_MOCHA = "#846851";
+/** Saturated moss + ring for customers (high contrast vs linen / brown plan art) */
+const LIVE_MAP_CUSTOMER_FILL = "#659b4c";
+const LIVE_MAP_CUSTOMER_STROKE = "#a7cc69";
+
+/** Matches header «Почати сесію» / primary cocoa actions — camera overlay icon buttons */
+const CAMERA_OVERLAY_PRIMARY_ICON_BTN =
+  "rounded-xl border border-transparent bg-[#411e03]/90 p-2 text-white transition-colors hover:bg-[#411e03] active:opacity-70 focus-visible:border focus-visible:border-[#d6b38d]/50 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50";
+
+const isLiveMapStaff = (point: OccupancyPoint | null | undefined): boolean => {
+  if (point == null) {
+    return false;
+  }
+  const isStaffVal = point.is_staff ?? point.additional_metadata?.is_staff;
+  return isStaffVal === true || isStaffVal === "true";
+};
 
 interface MyCafe {
   name: string;
@@ -75,6 +98,16 @@ const getAuthHeaders = (includeJson = false) => {
     ...(includeJson ? { "Content-Type": "application/json" } : {}),
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
+};
+
+/** Absolute URL for <img src> when API stores relative paths like /uploads/... */
+const resolveMediaUrl = (url: string) => {
+  const u = (url || "").trim();
+  if (!u) return "";
+  if (u.startsWith("http://") || u.startsWith("https://") || u.startsWith("data:")) {
+    return u;
+  }
+  return `${API_ROOT}${u.startsWith("/") ? "" : "/"}${u}`;
 };
 
 const normalizeMapZone = (zone: Partial<MapZone>, index: number): MapZone => {
@@ -127,7 +160,7 @@ async function uploadFloorPlanFile(file: File) {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch(`${API_ROOT}/api/cafes/me/floor-plan`, {
+  const response = await fetch(`${API_ROOT}/api/cafe/update-floor-plan`, {
     method: "POST",
     headers: getAuthHeaders(),
     body: formData,
@@ -376,7 +409,7 @@ function CalibrationModal({
                   />
                 </label>
                 <img
-                  src={floorPlanImg}
+                  src={resolveMediaUrl(floorPlanImg)}
                   alt="Floor plan"
                   className="h-full w-full object-contain"
                   onError={() => setShowFloorPlanUpload(true)}
@@ -424,6 +457,7 @@ function CameraView({
   onReplace,
   floorPlanImg,
   setFloorPlanImg,
+  onRecordedVideoEnded,
 }: {
   cam: CameraData;
   cameraIndex: number;
@@ -432,6 +466,7 @@ function CameraView({
   onReplace: (id: number, file: File) => void;
   floorPlanImg: string;
   setFloorPlanImg: React.Dispatch<React.SetStateAction<string>>;
+  onRecordedVideoEnded?: () => void;
 }) {
   const replaceInputRef = useRef<HTMLInputElement>(null);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -534,11 +569,11 @@ function CameraView({
       >
         <CardContent className="relative flex min-h-0 flex-1 flex-col p-4">
           <div
-            className={`pointer-events-none absolute top-6 left-6 z-10 flex items-center rounded-lg border border-slate-700/50 bg-slate-900/80 px-3 py-1.5 text-sm font-medium tracking-wide text-white shadow-sm backdrop-blur-md transition-all duration-300 ${
+            className={`pointer-events-none absolute top-6 left-6 z-10 flex items-center rounded-md border border-[#d7cdc1] bg-[#f5f3f0] px-3 py-1.5 text-sm font-semibold tracking-wide text-[#411e03] shadow-sm transition-all duration-300 ${
               isExpanded ? "opacity-100" : "opacity-0 group-hover:opacity-100"
             }`}
           >
-            Camera {cameraIndex + 1}
+            Камера {cameraIndex + 1}
           </div>
 
           {sessionStatus === "idle" && !isDrawing && (
@@ -565,14 +600,14 @@ function CameraView({
                   setIsDrawing(true);
                   setZonePoints([]);
                 }}
-                className="rounded-lg bg-slate-900/70 p-2 text-white shadow-sm backdrop-blur-sm hover:bg-emerald-500"
-                title="Визначити зону стаффу"
+                className={CAMERA_OVERLAY_PRIMARY_ICON_BTN}
+                title="Позначити зону Баристи"
               >
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
               </button>
               <button
                 onClick={() => setShowCalibration(true)}
-                className="rounded-lg bg-slate-900/70 p-2 text-white shadow-sm backdrop-blur-sm hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
+                className={CAMERA_OVERLAY_PRIMARY_ICON_BTN}
                 title="Калібрування камери"
                 disabled={!cam.filename}
               >
@@ -580,14 +615,14 @@ function CameraView({
               </button>
               <button
                 onClick={() => replaceInputRef.current?.click()}
-                className="rounded-lg bg-slate-900/70 p-2 text-white shadow-sm backdrop-blur-sm hover:bg-blue-500"
+                className={CAMERA_OVERLAY_PRIMARY_ICON_BTN}
                 title="Замінити відео"
               >
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
               </button>
               <button
                 onClick={() => setShowConfirm(true)}
-                className="rounded-lg bg-slate-900/70 p-2 text-white shadow-sm backdrop-blur-sm hover:bg-red-500"
+                className={CAMERA_OVERLAY_PRIMARY_ICON_BTN}
                 title="Видалити камеру"
               >
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
@@ -597,7 +632,7 @@ function CameraView({
 
           <div
             className={`relative aspect-video min-h-[250px] flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-xl bg-slate-950 ${
-              isDrawing ? "cursor-crosshair ring-4 ring-emerald-500" : ""
+              isDrawing ? "cursor-crosshair ring-2 ring-[#d6b38d]/40 ring-offset-2 ring-offset-slate-950" : ""
             }`}
             onClick={(e) => {
               if (!isDrawing) return;
@@ -612,12 +647,32 @@ function CameraView({
             }}
           >
             {sessionStatus === "running" && streamSrc && !streamEnded ? (
-              <img
-                src={streamSrc}
-                className="h-full w-full object-contain"
-                alt="Stream"
-                onError={() => setStreamEnded(true)}
-              />
+              <>
+                {cam.filename ? (
+                  <video
+                    key={`${cam.filename}-${streamSrc}`}
+                    className="pointer-events-none absolute left-0 top-0 z-0 h-px w-px opacity-0"
+                    aria-hidden
+                    muted
+                    playsInline
+                    autoPlay
+                    src={`${API_ROOT}/api/video_source/${encodeURIComponent(cam.filename)}?token=${encodeURIComponent(getAuthToken())}`}
+                    onEnded={(e) => {
+                      e.stopPropagation();
+                      onRecordedVideoEnded?.();
+                    }}
+                  />
+                ) : null}
+                <img
+                  src={streamSrc}
+                  className="relative z-[5] h-full w-full object-contain"
+                  alt="Stream"
+                  onError={() => {
+                    setStreamEnded(true);
+                    onRecordedVideoEnded?.();
+                  }}
+                />
+              </>
             ) : (
               <img
                 src={thumbnailSrc}
@@ -651,7 +706,7 @@ function CameraView({
                 <polyline
                   points={zonePoints.map((p) => `${p.x * 100},${p.y * 100}`).join(" ")}
                   fill="none"
-                  stroke="#10b981"
+                  stroke="#d6b38d"
                   strokeWidth="1.5"
                   strokeDasharray="2 2"
                 />
@@ -663,18 +718,18 @@ function CameraView({
                       cx={p.x * 100}
                       cy={p.y * 100}
                       r="1"
-                      fill="#10b981"
-                      stroke="#ffffff"
-                      strokeWidth="0.6"
+                      fill="#d6b38d"
+                      stroke="#411e03"
+                      strokeWidth="0.35"
                     />
                     <text
                       x={p.x * 100 + 1.5}
                       y={p.y * 100 - 1.5}
                       fontSize="4"
                       fontWeight="700"
-                      fill="#10b981"
-                      stroke="#0f172a"
-                      strokeWidth="0.3"
+                      fill="#411e03"
+                      stroke="#f5f3f0"
+                      strokeWidth="0.35"
                       paintOrder="stroke"
                     >
                       {index + 1}
@@ -684,12 +739,17 @@ function CameraView({
             </svg>
 
             {isDrawing && (
-              <div className="absolute bottom-4 left-1/2 z-40 flex -translate-x-1/2 gap-2 rounded-full border border-slate-700 bg-slate-900/95 p-2 shadow-2xl backdrop-blur-md">
+              <div
+                className="pointer-events-auto absolute bottom-4 left-1/2 z-20 inline-flex w-max max-w-[calc(100%-1rem)] -translate-x-1/2 flex-row flex-nowrap items-center justify-center gap-2 overflow-x-auto rounded-full bg-black/30 py-2 px-4 shadow-md ring-1 ring-black/10 backdrop-blur-sm [scrollbar-width:thin]"
+                role="toolbar"
+                aria-label="Дії розмітки зони"
+                onClick={(e) => e.stopPropagation()}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
                 {zonePoints.length > 0 && (
                   <Button
                     size="sm"
-                    variant="outline"
-                    className="h-8 border-slate-600 text-white"
+                    className="h-8 shrink-0 rounded-md border-0 bg-[#846851] px-3 text-sm font-medium leading-none text-white shadow-sm transition-colors hover:bg-[#735746] hover:text-white active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#d6b38d]/50 focus-visible:ring-offset-1 focus-visible:ring-offset-slate-950"
                     onClick={(e) => {
                       e.stopPropagation();
                       setZonePoints((prev) => prev.slice(0, -1));
@@ -700,19 +760,7 @@ function CameraView({
                 )}
                 <Button
                   size="sm"
-                  variant="outline"
-                  className="h-8 border-slate-600 text-white hover:bg-slate-800"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setZonePoints([]);
-                  }}
-                >
-                  Очистити
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-8 border-red-400/60 text-red-200 hover:bg-red-500/20"
+                  className="h-8 shrink-0 rounded-md border-0 bg-[#a34a3f] px-3 text-sm font-medium leading-none text-white shadow-sm transition-colors hover:bg-[#923f36] hover:text-white active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#d6b38d]/50 focus-visible:ring-offset-1 focus-visible:ring-offset-slate-950"
                   onClick={(e) => {
                     e.stopPropagation();
                     setIsDrawing(false);
@@ -723,7 +771,17 @@ function CameraView({
                 </Button>
                 <Button
                   size="sm"
-                  className="h-8 bg-emerald-500 text-white hover:bg-emerald-600"
+                  className="h-8 shrink-0 rounded-md border border-[#c4b8a8] bg-[#d7cdc1] px-3 text-sm font-medium leading-none text-[#411e03] shadow-sm transition-colors hover:bg-[#cdc4ba] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#846851]/40 focus-visible:ring-offset-1 focus-visible:ring-offset-slate-950"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setZonePoints([]);
+                  }}
+                >
+                  Очистити
+                </Button>
+                <Button
+                  size="sm"
+                  className="h-8 shrink-0 rounded-md border-0 bg-[#659b4c] px-3 text-sm font-medium leading-none text-white shadow-sm transition-colors hover:bg-[#55843f] hover:text-white active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#659b4c]/45 focus-visible:ring-offset-1 focus-visible:ring-offset-slate-950"
                   onClick={(e) => {
                     e.stopPropagation();
                     saveZone();
@@ -745,7 +803,7 @@ function CameraView({
                     e.stopPropagation();
                     setIsExpanded(!isExpanded);
                   }}
-                  className="rounded-lg bg-slate-900/70 p-2 text-white shadow-sm backdrop-blur-sm hover:bg-slate-700"
+                  className={CAMERA_OVERLAY_PRIMARY_ICON_BTN}
                   title={isExpanded ? "Зменшити екран" : "Збільшити екран"}
                 >
                   {isExpanded ? (
@@ -771,6 +829,7 @@ function LiveMonitorSidePanel({
   setFloorPlanImg,
   mapZones,
   setMapZones,
+  isProcessing,
 }: {
   sessionStatus: SessionStatus;
   camerasCount: number;
@@ -779,6 +838,7 @@ function LiveMonitorSidePanel({
   setFloorPlanImg: React.Dispatch<React.SetStateAction<string>>;
   mapZones: MapZone[];
   setMapZones: React.Dispatch<React.SetStateAction<MapZone[]>>;
+  isProcessing?: boolean;
 }) {
   const [occupancy, setOccupancy] = useState<OccupancyPoint[]>([]);
   const [pointHistory, setPointHistory] = useState<OccupancyHistoryPoint[]>([]);
@@ -787,6 +847,10 @@ function LiveMonitorSidePanel({
   const [mapScale, setMapScale] = useState(1);
   const [isAnalyzingZones, setIsAnalyzingZones] = useState(false);
   const floorPlanUploadRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setFloorPlanError(false);
+  }, [floorPlanImg]);
 
   useEffect(() => {
     if (sessionStatus !== "running") {
@@ -833,8 +897,8 @@ function LiveMonitorSidePanel({
     };
   }, [sessionStatus]);
 
-  const activeCustomers = occupancy.filter((point) => !point.is_staff).length;
-  const activeStaff = occupancy.filter((point) => point.is_staff).length;
+  const activeCustomers = occupancy.filter((point) => !isLiveMapStaff(point)).length;
+  const activeStaff = occupancy.filter((point) => isLiveMapStaff(point)).length;
   const zoneCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     mapZones.forEach((zone) => {
@@ -844,13 +908,19 @@ function LiveMonitorSidePanel({
     let otherCount = 0;
 
     occupancy.forEach((point) => {
-      if (point.is_staff) {
+      if (isLiveMapStaff(point)) {
         return;
       }
 
       let foundZone = false;
+      const pad = ZONE_DISPLAY_PADDING_PX;
       for (const zone of mapZones) {
-        if (point.x >= zone.xMin && point.x <= zone.xMax && point.y >= zone.yMin && point.y <= zone.yMax) {
+        if (
+          point.x >= zone.xMin - pad &&
+          point.x <= zone.xMax + pad &&
+          point.y >= zone.yMin - pad &&
+          point.y <= zone.yMax + pad
+        ) {
           counts[zone.id] += 1;
           foundZone = true;
           break;
@@ -952,6 +1022,12 @@ function LiveMonitorSidePanel({
                 <span className="text-[#846851]">Клієнтів у закладі</span>
                 <span className="font-semibold text-[#411e03]">{totalCustomers}</span>
               </div>
+              {isProcessing ? (
+                <div className="mt-2 flex items-center gap-2 text-sm font-medium text-[#846851]">
+                  <div className="h-4 w-4 animate-spin rounded-full border-2 border-[#659b4c] border-t-transparent" />
+                  Обробка даних...
+                </div>
+              ) : null}
             </div>
           </CardContent>
         </Card>
@@ -977,7 +1053,7 @@ function LiveMonitorSidePanel({
         </Card>
       </div>
 
-      <Card className="h-fit min-h-[420px] rounded-2xl border-slate-200 bg-white shadow-sm">
+      <Card className="h-fit min-h-[420px] rounded-2xl border-[#d7cdc1] bg-white shadow-sm">
         <CardContent className="p-6">
           <div className="mb-4 border-b pb-2">
             <h2 className="text-lg font-semibold text-[#411e03]">Live 2D Map (Дедупліковано)</h2>
@@ -1020,9 +1096,9 @@ function LiveMonitorSidePanel({
               </div>
             )}
             {floorPlanImg && !floorPlanError ? (
-              <div className="h-auto w-full overflow-auto">
+              <div className="h-auto w-full overflow-auto outline-none focus:outline-none focus-visible:outline-none">
                 <div
-                  className="relative h-auto w-full"
+                  className="relative h-auto w-full overflow-hidden"
                   style={{
                     transform: `scale(${mapScale})`,
                     transformOrigin: "top left",
@@ -1030,9 +1106,9 @@ function LiveMonitorSidePanel({
                   }}
                 >
                   <img
-                    src={floorPlanImg}
+                    src={resolveMediaUrl(floorPlanImg)}
                     alt="Floor plan"
-                    className="block h-auto w-full"
+                    className="block h-auto w-full border-0"
                     onLoad={(event) => {
                       setFloorPlanError(false);
                       setFloorPlanSize({
@@ -1043,7 +1119,7 @@ function LiveMonitorSidePanel({
                     onError={() => setFloorPlanError(true)}
                   />
                   <svg
-                    className="pointer-events-none absolute inset-0 h-full w-full"
+                    className="pointer-events-none absolute inset-0 h-full w-full overflow-hidden"
                     viewBox={`0 0 ${floorPlanSize.width} ${floorPlanSize.height}`}
                     preserveAspectRatio="xMidYMid meet"
                   >
@@ -1054,19 +1130,19 @@ function LiveMonitorSidePanel({
                           y={zone.yMin}
                           width={Math.max(0, zone.xMax - zone.xMin)}
                           height={Math.max(0, zone.yMax - zone.yMin)}
-                          fill="rgba(59, 130, 246, 0.2)"
-                          stroke="#2563eb"
+                          fill="rgba(138, 137, 95, 0.18)"
+                          stroke="#8a895f"
                           strokeWidth="2"
                         />
                         <text
                           x={zone.xMin + 8}
                           y={zone.yMin + 20}
-                          fill="#dbeafe"
+                          fill="#411e03"
                           fontSize="16"
                           fontWeight="700"
                           paintOrder="stroke"
-                          stroke="#1e3a8a"
-                          strokeWidth="0.6"
+                          stroke="#f5f3f0"
+                          strokeWidth="0.75"
                         >
                           {zone.name}
                         </text>
@@ -1078,39 +1154,46 @@ function LiveMonitorSidePanel({
                       if (fadeRatio <= 0) {
                         return null;
                       }
+                      const isStaff = isLiveMapStaff(pt);
+                      const fillColor = isStaff ? BRAND_COCOA : LIVE_MAP_CUSTOMER_FILL;
                       return (
                         <circle
                           key={`${pt.timestamp}-${pt.x}-${pt.y}-${i}`}
                           cx={pt.x}
                           cy={pt.y}
                           r={4 * fadeRatio}
-                          fill={pt.is_staff ? "#22c55e" : "#3b82f6"}
+                          fill={fillColor}
                           opacity={fadeRatio * 0.5}
                         />
                       );
                     })}
-                    {occupancy.map((point, index) => (
+                    {occupancy.map((point, index) => {
+                      const isStaff = isLiveMapStaff(point);
+                      const fillColor = isStaff ? BRAND_COCOA : LIVE_MAP_CUSTOMER_FILL;
+                      const strokeColor = isStaff ? BRAND_MOCHA : LIVE_MAP_CUSTOMER_STROKE;
+                      return (
                       <g key={`${point.x}-${point.y}-${index}`}>
                         <circle
                           cx={point.x}
                           cy={point.y}
                           r="22"
-                          fill={point.is_staff ? "#22c55e" : "#3b82f6"}
+                          fill={fillColor}
                           opacity="0.18"
                           className="animate-ping"
                         />
-                        <circle cx={point.x} cy={point.y} r="8" fill={point.is_staff ? "#22c55e" : "#3b82f6"} opacity="0.95" />
+                        <circle cx={point.x} cy={point.y} r="8" fill={fillColor} opacity="0.95" />
                         <circle
                           cx={point.x}
                           cy={point.y}
                           r="12"
                           fill="none"
-                          stroke={point.is_staff ? "#86efac" : "#93c5fd"}
+                          stroke={strokeColor}
                           strokeWidth="2"
                           opacity="0.9"
                         />
                       </g>
-                    ))}
+                    );
+                    })}
                   </svg>
                 </div>
               </div>
@@ -1144,6 +1227,28 @@ function LiveMonitorSidePanel({
               </button>
             </div>
           </div>
+          <div
+            className="flex flex-wrap items-center gap-6 mt-3 text-sm font-medium text-[#846851]"
+            role="note"
+            aria-label="Умовні позначення на карті"
+          >
+            <div className="flex items-center gap-2">
+              <span
+                className="h-3 w-3 shrink-0 rounded-full"
+                style={{ backgroundColor: LIVE_MAP_CUSTOMER_FILL }}
+                aria-hidden
+              />
+              <span>— клієнти закладу</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span
+                className="h-3 w-3 shrink-0 rounded-full"
+                style={{ backgroundColor: BRAND_COCOA }}
+                aria-hidden
+              />
+              <span>— персонал</span>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>
@@ -1156,7 +1261,7 @@ function AddCameraCard({ onUpload }: { onUpload: (file: File) => void }) {
   return (
     <div
       onClick={() => ref.current?.click()}
-      className="group aspect-video cursor-pointer rounded-2xl border-2 border-dashed border-slate-300 transition-all duration-300 hover:bg-white"
+      className="group aspect-video cursor-pointer rounded-2xl border-2 border-dashed border-slate-300 transition-all duration-300 hover:border-[#659b4c] hover:bg-[#659b4c]/5"
     >
       <input
         type="file"
@@ -1171,10 +1276,10 @@ function AddCameraCard({ onUpload }: { onUpload: (file: File) => void }) {
         }}
       />
       <div className="flex h-full flex-col items-center justify-center">
-        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-400 transition-transform group-hover:scale-110">
+        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#659b4c]/10 text-lg font-light text-[#659b4c] transition-transform group-hover:scale-110 group-hover:bg-[#659b4c]/15">
           ＋
         </div>
-        <span className="mt-3 text-sm font-medium text-[#846851] group-hover:text-emerald-600">
+        <span className="mt-3 text-sm font-medium text-[#659b4c] group-hover:text-[#55843f]">
           Додати нову камеру
         </span>
       </div>
@@ -1195,8 +1300,32 @@ export default function Dashboard() {
   const [floorPlanImg, setFloorPlanImg] = useState("");
   const [mapZones, setMapZones] = useState<MapZone[]>([]);
   const [isEndingSession, setIsEndingSession] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [showNotification, setShowNotification] = useState(false);
+  const [isProfileFloorPlanUploading, setIsProfileFloorPlanUploading] = useState(false);
   const nextCameraIdRef = useRef(1);
   const profileDropdownRef = useRef<HTMLDivElement | null>(null);
+  const endingSessionRef = useRef(false);
+  const notificationTimerRef = useRef<number | null>(null);
+  const camerasRef = useRef(cameras);
+  const sessionStatusRef = useRef(sessionStatus);
+  const sawBackendStreamRef = useRef(false);
+
+  useEffect(() => {
+    camerasRef.current = cameras;
+  }, [cameras]);
+
+  useEffect(() => {
+    sessionStatusRef.current = sessionStatus;
+  }, [sessionStatus]);
+
+  useEffect(() => {
+    return () => {
+      if (notificationTimerRef.current !== null) {
+        window.clearTimeout(notificationTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -1416,32 +1545,158 @@ export default function Dashboard() {
     }
   };
 
-  const endSession = async (clearCameras: boolean) => {
-    if (isEndingSession) {
+  const endSession = useCallback(async (clearCameras: boolean) => {
+    if (endingSessionRef.current) {
       return;
     }
-
+    endingSessionRef.current = true;
     setIsEndingSession(true);
+    setIsProcessing(true);
+
     try {
-      const response = await fetch("http://localhost:8000/api/end_session", {
+      const response = await fetch(`${API_ROOT}/api/end_session`, {
         method: "POST",
         headers: getAuthHeaders(),
       });
+      const data = (await response.json()) as {
+        status?: string;
+        message?: string;
+        session_id?: string;
+      };
+
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        throw new Error(data.message || `HTTP ${response.status}`);
       }
-      const data = await response.json();
+
+      if (data.status === "already_processing") {
+        setIsProcessing(false);
+        return;
+      }
+
+      if (data.status === "no_snapshots") {
+        setIsProcessing(false);
+        alert("Немає знімків для збереження. Сесію не було відправлено на обробку.");
+        return;
+      }
+
+      if (data.status !== "success") {
+        setIsProcessing(false);
+        alert(data.message || "Не вдалося завершити сесію.");
+        return;
+      }
+
       console.log("Session finalization started:", data.session_id);
 
       setSessionStatus("idle");
       if (clearCameras) {
         setCameras([]);
       }
+
+      setIsProcessing(false);
+      setShowNotification(true);
+      if (notificationTimerRef.current !== null) {
+        window.clearTimeout(notificationTimerRef.current);
+      }
+      notificationTimerRef.current = window.setTimeout(() => {
+        setShowNotification(false);
+        notificationTimerRef.current = null;
+      }, 3000);
     } catch (error) {
       console.error("Помилка завершення сесії:", error);
+      setIsProcessing(false);
       alert("Не вдалося завершити сесію та запустити пост-обробку.");
     } finally {
+      endingSessionRef.current = false;
       setIsEndingSession(false);
+    }
+  }, []);
+
+  const tryAutoStopAfterStreamsIdle = useCallback(async () => {
+    if (sessionStatusRef.current !== "running") {
+      return;
+    }
+    try {
+      const r = await fetch(`${API_ROOT}/api/live_video_streams`, {
+        headers: getAuthHeaders(),
+      });
+      if (!r.ok) {
+        return;
+      }
+      const data = (await r.json()) as { active_filenames?: string[] };
+      const active = new Set(data.active_filenames ?? []);
+      const mine = camerasRef.current.map((c) => c.filename).filter(Boolean) as string[];
+      if (mine.length === 0) {
+        return;
+      }
+      const anyMineActive = mine.some((f) => active.has(f));
+      if (anyMineActive) {
+        sawBackendStreamRef.current = true;
+        return;
+      }
+      if (!sawBackendStreamRef.current) {
+        return;
+      }
+      await endSession(false);
+    } catch (error) {
+      console.error("Помилка перевірки стану відео-стрімів:", error);
+    }
+  }, [endSession]);
+
+  const handleRecordedVideoEnded = useCallback(() => {
+    sawBackendStreamRef.current = true;
+    void tryAutoStopAfterStreamsIdle();
+  }, [tryAutoStopAfterStreamsIdle]);
+
+  useEffect(() => {
+    if (sessionStatus !== "running") {
+      sawBackendStreamRef.current = false;
+      return;
+    }
+    sawBackendStreamRef.current = false;
+    const id = window.setInterval(() => void tryAutoStopAfterStreamsIdle(), 1500);
+    void tryAutoStopAfterStreamsIdle();
+    return () => window.clearInterval(id);
+  }, [sessionStatus, tryAutoStopAfterStreamsIdle]);
+
+  const handleProfilePlanUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+    const token = localStorage.getItem("cafe_token");
+    if (!token) {
+      return;
+    }
+
+    setIsProfileFloorPlanUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await fetch(`${API_ROOT}/api/cafe/update-floor-plan`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+      const data = (await response.json()) as { detail?: string; floor_plan_url?: string };
+      if (!response.ok) {
+        throw new Error(data.detail || "Не вдалося оновити план приміщення.");
+      }
+      const url = data.floor_plan_url || "";
+      if (!url) {
+        throw new Error("Сервер не повернув URL плану.");
+      }
+      setMyCafe((prev) =>
+        prev
+          ? { ...prev, floor_plan_url: url }
+          : { name: "", address: "", floor_plan_url: url },
+      );
+      setFloorPlanImg(url);
+    } catch (error) {
+      console.error("Помилка оновлення плану приміщення:", error);
+      alert("Не вдалося оновити план приміщення.");
+    } finally {
+      setIsProfileFloorPlanUploading(false);
     }
   };
 
@@ -1471,49 +1726,103 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-[#f5f3f0] font-sans">
+      {showNotification ? (
+        <div
+          className="fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-lg border-l-4 border-[#659b4c] bg-white px-4 py-3 shadow-lg"
+          role="status"
+        >
+          <span className="text-[#659b4c]" aria-hidden>
+            ✓
+          </span>
+          <p className="text-sm text-[#411e03]">Дані успішно збережено в базі!</p>
+        </div>
+      ) : null}
       <div className="grid w-full gap-6 px-[30px] py-6">
         <header className="flex flex-col justify-between gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm transition-all duration-300 lg:flex-row lg:items-center">
           <div className="flex items-center gap-6">
             <div>
-              <h1 className="text-xl font-bold text-[#411e03]">☕ Cafe Monitor</h1>
-              <p className="text-xs font-semibold uppercase tracking-wider text-[#846851]">
+              <h1 className="text-3xl font-bold leading-tight text-[#411e03]">☕ Cafe Monitor</h1>
+              <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
                 {activeTab === "live" ? (
                   <>
                     Статус сесії:{" "}
-                    <span className={sessionStatus === "running" ? "text-emerald-500" : "text-slate-400"}>
+                    <span className={sessionStatus === "running" ? "text-[#659b4c]" : "text-slate-400"}>
                       {sessionStatus === "idle" ? "Очікує запуску" : sessionStatus}
                     </span>
                   </>
                 ) : (
-                  "MongoDB analytics dashboard"
+                  "MONGODB ANALYTICS DASHBOARD"
                 )}
               </p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-4">
-            {activeTab === "live" && sessionStatus === "idle" && (
-              <Button
-                className="rounded-xl bg-emerald-600 px-6 text-white shadow-lg shadow-emerald-200 transition-all active:scale-95 hover:bg-emerald-700"
-                onClick={() => setSessionStatus("running")}
-                disabled={cameras.length === 0}
-              >
-                ▶ Почати сесію
-              </Button>
-            )}
+          <div className="flex flex-wrap items-center gap-4 lg:gap-6">
+            <div className="flex flex-wrap items-center gap-2">
+              {activeTab === "live" && sessionStatus === "idle" && (
+                <Button
+                  className="flex items-center gap-2 rounded-xl border border-transparent bg-[#411e03]/90 px-6 text-white transition-colors hover:bg-[#411e03] active:opacity-70 focus-visible:border focus-visible:border-[#d6b38d]/50 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 disabled:opacity-50"
+                  onClick={() => setSessionStatus("running")}
+                  disabled={cameras.length === 0}
+                >
+                  <Play className="h-4 w-4 shrink-0 text-white" strokeWidth={2.25} aria-hidden />
+                  Почати сесію
+                </Button>
+              )}
+              {activeTab === "live" && sessionStatus !== "idle" && (
+                <>
+                  <Button
+                    className="flex h-10 items-center gap-2 rounded-xl border border-transparent bg-[#411e03]/90 px-5 text-white transition-colors hover:bg-[#411e03] active:opacity-70 focus-visible:border focus-visible:border-[#d6b38d]/50 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 disabled:opacity-50"
+                    onClick={() => void endSession(false)}
+                    disabled={isEndingSession}
+                  >
+                    {isEndingSession ? (
+                      "Завершення..."
+                    ) : (
+                      <>
+                        <Pause className="h-4 w-4 shrink-0 text-white" strokeWidth={2.25} aria-hidden />
+                        Зупинити
+                      </>
+                    )}
+                  </Button>
+                  <Button
+                    className="flex h-10 items-center gap-2 rounded-xl border border-transparent bg-[#411e03]/90 px-5 text-white transition-colors hover:bg-[#411e03] active:opacity-70 focus-visible:border focus-visible:border-[#d6b38d]/50 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 disabled:opacity-50"
+                    onClick={() => void endSession(true)}
+                    disabled={isEndingSession}
+                  >
+                    {isEndingSession ? (
+                      "Завершення..."
+                    ) : (
+                      <>
+                        <Square className="h-3.5 w-3.5 shrink-0 text-white" strokeWidth={2.5} aria-hidden />
+                        Завершити
+                      </>
+                    )}
+                  </Button>
+                </>
+              )}
+            </div>
 
             <div className="flex gap-2">
               <Button
                 onClick={() => setActiveTab("live")}
-                className={activeTab === "live" ? "bg-slate-900 text-white hover:bg-slate-800" : ""}
-                variant={activeTab === "live" ? "default" : "outline"}
+                variant="outline"
+                className={
+                  activeTab === "live"
+                    ? "border-[#411e03] bg-[#411e03] text-white hover:bg-[#411e03]/90 hover:text-white focus-visible:ring-[#411e03]"
+                    : "border-[#d7cdc1] bg-white text-[#411e03] hover:bg-[#f5f3f0] focus-visible:ring-[#8a895f]"
+                }
               >
                 Live
               </Button>
               <Button
                 onClick={() => setActiveTab("analytics")}
-                className={activeTab === "analytics" ? "bg-slate-900 text-white hover:bg-slate-800" : ""}
-                variant={activeTab === "analytics" ? "default" : "outline"}
+                variant="outline"
+                className={
+                  activeTab === "analytics"
+                    ? "border-[#411e03] bg-[#411e03] text-white hover:bg-[#411e03]/90 hover:text-white focus-visible:ring-[#411e03]"
+                    : "border-[#d7cdc1] bg-white text-[#411e03] hover:bg-[#f5f3f0] focus-visible:ring-[#8a895f]"
+                }
               >
                 Analytics
               </Button>
@@ -1521,8 +1830,9 @@ export default function Dashboard() {
 
             <div className="relative" ref={profileDropdownRef}>
               <button
+                type="button"
                 onClick={() => setIsProfileOpen(!isProfileOpen)}
-                className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white py-1.5 pl-2 pr-3 shadow-sm transition-colors hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-[#8a895f]"
+                className="flex items-center gap-2 rounded-lg border border-[#d7cdc1] bg-white py-1.5 pl-2 pr-3 shadow-sm transition-colors hover:bg-[#f5f3f0] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#8a895f]/40 focus-visible:ring-offset-0"
               >
                 <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[#411e03] text-sm font-bold text-white">
                   {currentUser?.full_name ? currentUser.full_name.charAt(0).toUpperCase() : "U"}
@@ -1535,19 +1845,62 @@ export default function Dashboard() {
               </button>
 
               {isProfileOpen && (
-                <div className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-slate-100 bg-white py-2 shadow-xl">
-                  <div className="mb-1 border-b border-slate-100 px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <User size={14} className="text-[#846851]" />
-                      <p className="text-sm font-bold text-[#411e03]">{currentUser?.full_name || "User"}</p>
+                <div className="absolute right-0 z-50 mt-2 w-64 max-w-[min(18rem,calc(100vw-2rem))] rounded-xl border border-slate-100 bg-white py-2 shadow-xl">
+                  <div className="px-4 py-3">
+                    <div className="flex items-start gap-3">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#411e03] text-sm font-bold text-white">
+                        {currentUser?.full_name?.charAt(0).toUpperCase() || "U"}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-bold text-[#411e03]">{currentUser?.full_name || "User"}</p>
+                        <p className="mt-0.5 truncate text-left text-xs text-[#846851]">
+                          {currentUser?.email || ""}
+                        </p>
+                      </div>
                     </div>
-                    <p className="mt-0.5 truncate text-xs text-[#846851]">{currentUser?.email || ""}</p>
+
+                    <hr className="my-2 border-slate-100" />
+
+                    <div className="mt-2 rounded-md border border-[#d7cdc1]/50 bg-[#d7cdc1]/20 p-2">
+                      <div className="flex gap-2">
+                        <Store size={14} className="mt-0.5 shrink-0 text-[#846851]" aria-hidden />
+                        <div className="min-w-0 flex-1 text-left">
+                          <p className="text-sm font-semibold leading-snug text-[#411e03]">
+                            {myCafe?.name?.trim() || "Назва кафе"}
+                          </p>
+                          <p className="mt-1 text-left text-xs leading-snug text-[#846851]">
+                            {myCafe?.address?.trim() || "Адреса не вказана"}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="border-t border-slate-100 px-2 pb-1 pt-1">
+                    <input
+                      type="file"
+                      id="profileFloorPlanUpload"
+                      className="hidden"
+                      accept="image/*"
+                      onChange={handleProfilePlanUpload}
+                      disabled={isProfileFloorPlanUploading}
+                    />
+                    <button
+                      type="button"
+                      disabled={isProfileFloorPlanUploading}
+                      onClick={() => document.getElementById("profileFloorPlanUpload")?.click()}
+                      className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm font-medium text-[#411e03] transition-colors hover:bg-[#d7cdc1]/30 disabled:opacity-50"
+                    >
+                      <ImageUp size={16} aria-hidden />
+                      {isProfileFloorPlanUploading ? "Завантаження..." : "Оновити план приміщення"}
+                    </button>
                   </div>
 
                   <div className="px-2">
                     <button
+                      type="button"
                       onClick={handleLogout}
-                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
+                      className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm font-medium text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
                     >
                       <LogOut size={16} />
                       Вийти з акаунта
@@ -1556,27 +1909,6 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
-
-            {activeTab === "live" &&
-              (sessionStatus === "idle" ? null : (
-                <div className="flex gap-2">
-                  <Button
-                    variant="outline"
-                    className="h-10 border-slate-300 px-5 text-slate-700 hover:bg-slate-100"
-                    onClick={() => void endSession(false)}
-                    disabled={isEndingSession}
-                  >
-                    {isEndingSession ? "Завершення..." : "⏸ Зупинити"}
-                  </Button>
-                  <Button
-                    className="h-10 rounded-xl bg-slate-900 px-5 text-white hover:bg-slate-800"
-                    onClick={() => void endSession(true)}
-                    disabled={isEndingSession}
-                  >
-                    {isEndingSession ? "Завершення..." : "⏹ Завершити"}
-                  </Button>
-                </div>
-              ))}
           </div>
         </header>
 
@@ -1594,6 +1926,7 @@ export default function Dashboard() {
                     onReplace={replaceCamera}
                     floorPlanImg={floorPlanImg}
                     setFloorPlanImg={setFloorPlanImg}
+                    onRecordedVideoEnded={handleRecordedVideoEnded}
                   />
                 ))}
                 {sessionStatus === "idle" && <AddCameraCard onUpload={addCamera} />}
@@ -1609,6 +1942,7 @@ export default function Dashboard() {
                 setFloorPlanImg={setFloorPlanImg}
                 mapZones={mapZones}
                 setMapZones={setMapZones}
+                isProcessing={isProcessing}
               />
             </div>
           </div>

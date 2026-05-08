@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import * as heatmapModule from "heatmap.js";
 import jsPDF from "jspdf";
 import { toPng } from "html-to-image";
 import {
@@ -19,12 +18,13 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "../components/ui/tabs";
 import {
+  ArrowDownRight,
+  ArrowUpRight,
   Clock,
   Download,
   Info,
   MapPinned,
   RefreshCw,
-  TrendingDown,
   TrendingUp,
   Users,
   X,
@@ -36,35 +36,19 @@ interface HeatmapPoint {
   y: number;
 }
 
-interface HeatmapDatum {
-  x: number;
-  y: number;
-  value: number;
-}
-
-interface HeatmapInstance {
-  setData: (data: { max: number; min: number; data: HeatmapDatum[] }) => void;
-}
-
 interface MyCafe {
   name: string;
   address?: string;
   floor_plan_url: string;
 }
 
-interface SummaryMetric {
-  value: number | string;
-  trend?: number;
-  is_positive?: boolean;
-}
-
 interface AnalyticsSummary {
-  total_customers?: SummaryMetric;
-  avg_time?: SummaryMetric;
-  peak_hour?: {
-    value?: string;
-    subtext?: string;
-  };
+  total_clients: number;
+  clients_trend: number | null;
+  avg_duration_seconds: number;
+  duration_trend: number | null;
+  peak_hour: string | null;
+  peak_clients: number | null;
 }
 
 interface DemographicsDatum {
@@ -102,23 +86,129 @@ interface RouteAnalyticsRow {
 }
 
 const API_ROOT = "http://localhost:8000";
-const ORIGINAL_WIDTH = 1920;
-const ORIGINAL_HEIGHT = 1080;
 
-type HeatmapFactory = {
-  create: (config: Record<string, unknown>) => HeatmapInstance;
-};
-
-function resolveHeatmapFactory(): HeatmapFactory | null {
-  const raw = heatmapModule as unknown as { default?: HeatmapFactory } & Partial<HeatmapFactory>;
-  if (typeof raw.create === "function") {
-    return raw as HeatmapFactory;
-  }
-  if (raw.default && typeof raw.default.create === "function") {
-    return raw.default;
-  }
-  return null;
+function toYmd(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
+
+function buildAnalyticsSummaryQuery(dateTab: string, customDate: string, timeRange: string): string {
+  const params = new URLSearchParams();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const custom = customDate.trim();
+
+  if (custom) {
+    params.set("start_date", custom);
+    params.set("end_date", custom);
+  } else if (dateTab === "today") {
+    const y = toYmd(today);
+    params.set("start_date", y);
+    params.set("end_date", y);
+  } else if (dateTab === "7days") {
+    const start = new Date(today);
+    start.setDate(start.getDate() - 7);
+    params.set("start_date", toYmd(start));
+    params.set("end_date", toYmd(today));
+  } else if (dateTab === "30days") {
+    const start = new Date(today);
+    start.setDate(start.getDate() - 30);
+    params.set("start_date", toYmd(start));
+    params.set("end_date", toYmd(today));
+  }
+
+  const tr = timeRange.trim();
+  if (tr.includes("-")) {
+    params.set("time_range", tr);
+  }
+
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+
+function formatDurationUk(totalSeconds: number): string {
+  const s = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m} хв ${r} с`;
+}
+
+function summaryComparisonLabel(dateTab: string, customDate: string): string {
+  const custom = customDate.trim();
+  if (custom) {
+    return "до попереднього періоду";
+  }
+  if (dateTab === "all" || dateTab === "") {
+    return "";
+  }
+  switch (dateTab) {
+    case "today":
+      return "від учора";
+    case "7days":
+      return "від минулого тижня";
+    case "30days":
+      return "від минулого місяця";
+    default:
+      return "до попереднього періоду";
+  }
+}
+
+function SummaryTrendFootnote({
+  trend,
+  comparisonLabel,
+}: {
+  trend: number | null;
+  comparisonLabel: string;
+}) {
+  if (!comparisonLabel) {
+    return null;
+  }
+  if (trend == null || trend === 0) {
+    return <div className="mt-1.5 text-xs font-medium text-[#846851]">Немає змін</div>;
+  }
+  const up = trend > 0;
+  return (
+    <div
+      className={`mt-1.5 flex flex-wrap items-center gap-1 text-sm font-medium ${
+        up ? "text-emerald-600" : "text-red-600"
+      }`}
+    >
+      {up ? <ArrowUpRight size={16} strokeWidth={2.5} aria-hidden /> : <ArrowDownRight size={16} strokeWidth={2.5} aria-hidden />}
+      <span>{Math.abs(trend)}%</span>
+      <span className="font-normal text-[#846851]">{comparisonLabel}</span>
+    </div>
+  );
+}
+
+const SPLAT_RADIUS_PX = 40;
+
+function heatRgbForNormalizedIntensity(t: number): [number, number, number] {
+  const x = Math.max(0, Math.min(1, t));
+  const lerp = (a: number, b: number, u: number) => Math.round(a + (b - a) * u);
+  if (x <= 0.25) {
+    const u = x / 0.25;
+    return [0, lerp(0, 255, u), lerp(255, 0, u)];
+  }
+  if (x <= 0.55) {
+    const u = (x - 0.25) / 0.3;
+    return [lerp(0, 255, u), 255, 0];
+  }
+  if (x <= 0.85) {
+    const u = (x - 0.55) / 0.3;
+    return [255, lerp(255, 0, u), 0];
+  }
+  return [255, 0, 0];
+}
+
+const HEAT_RGB_LUT: ReadonlyArray<readonly [number, number, number]> = (() => {
+  const out: [number, number, number][] = [];
+  for (let a = 0; a < 256; a++) {
+    out.push(heatRgbForNormalizedIntensity(a / 255));
+  }
+  return out;
+})();
 
 const buildFloorPlanSrc = (url?: string | null, cacheKey?: number) => {
   const rawUrl = (url || "").trim();
@@ -148,12 +238,16 @@ function AnalyticsHeatmap({
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
-  const heatmapLayerRef = useRef<HTMLDivElement>(null);
-  const heatmapInstanceRef = useRef<HeatmapInstance | null>(null);
+  const heatmapContainerRef = useRef<HTMLCanvasElement>(null);
   const [imageError, setImageError] = useState(false);
   const resolvedFloorPlanUrl = buildFloorPlanSrc(floorPlanUrl);
   const [overlayBounds, setOverlayBounds] = useState({ left: 16, top: 16, width: 0, height: 0 });
   const [layoutTick, setLayoutTick] = useState(0);
+  const [imageIntrinsicSize, setImageIntrinsicSize] = useState({ width: 1920, height: 1080 });
+
+  useEffect(() => {
+    setImageIntrinsicSize({ width: 1920, height: 1080 });
+  }, [floorPlanUrl]);
 
   useEffect(() => {
     const wrapper = wrapperRef.current;
@@ -180,14 +274,14 @@ function AnalyticsHeatmap({
         return;
       }
 
-      const denomW = ORIGINAL_WIDTH > 0 ? ORIGINAL_WIDTH : 1;
-      const denomH = ORIGINAL_HEIGHT > 0 ? ORIGINAL_HEIGHT : 1;
+      const denomW = imageIntrinsicSize.width > 0 ? imageIntrinsicSize.width : 1;
+      const denomH = imageIntrinsicSize.height > 0 ? imageIntrinsicSize.height : 1;
       const scale = Math.min(contentWidth / denomW, contentHeight / denomH);
       if (!Number.isFinite(scale) || scale <= 0) {
         return;
       }
-      const renderedWidth = ORIGINAL_WIDTH * scale;
-      const renderedHeight = ORIGINAL_HEIGHT * scale;
+      const renderedWidth = imageIntrinsicSize.width * scale;
+      const renderedHeight = imageIntrinsicSize.height * scale;
       const offsetLeft = paddingLeft + (contentWidth - renderedWidth) / 2;
       const offsetTop = paddingTop + (contentHeight - renderedHeight) / 2;
 
@@ -212,26 +306,23 @@ function AnalyticsHeatmap({
       resizeObserver.disconnect();
       window.removeEventListener("resize", onWinResize);
     };
-  }, [floorPlanUrl, layoutTick]);
+  }, [floorPlanUrl, layoutTick, imageIntrinsicSize]);
 
   useEffect(() => {
-    const container = heatmapLayerRef.current;
-    if (!container) {
+    const canvas = heatmapContainerRef.current;
+    if (!canvas) {
       return;
     }
 
-    if (container.offsetWidth === 0 || container.offsetHeight === 0) {
+    if (canvas.offsetWidth === 0 || canvas.offsetHeight === 0) {
       return;
     }
     if (overlayBounds.width <= 0 || overlayBounds.height <= 0) {
       return;
     }
 
-    const scaleX = overlayBounds.width / ORIGINAL_WIDTH;
-    const scaleY = overlayBounds.height / ORIGINAL_HEIGHT;
-    if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0) {
-      return;
-    }
+    const iw = imageIntrinsicSize.width > 0 ? imageIntrinsicSize.width : 1;
+    const ih = imageIntrinsicSize.height > 0 ? imageIntrinsicSize.height : 1;
 
     const safePoints = Array.isArray(points)
       ? points.filter(
@@ -245,76 +336,100 @@ function AnalyticsHeatmap({
         )
       : [];
 
-    const scaledPoints: HeatmapDatum[] = safePoints
-      .map((point) => {
-        const x = Math.round(point.x * scaleX);
-        const y = Math.round(point.y * scaleY);
-        return { x, y, value: 1 };
-      })
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) {
+      return;
+    }
+
+    const w = canvas.offsetWidth;
+    const h = canvas.offsetHeight;
+    canvas.width = w;
+    canvas.height = h;
+
+    const scaleX = w / iw;
+    const scaleY = h / ih;
+    if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0) {
+      return;
+    }
+
+    ctx.clearRect(0, 0, w, h);
+
+    const scaledPoints = safePoints
+      .map((point) => ({
+        x: Math.round(point.x * scaleX),
+        y: Math.round(point.y * scaleY),
+      }))
       .filter(
         (point) =>
           Number.isFinite(point.x) &&
           Number.isFinite(point.y) &&
           point.x >= 0 &&
           point.y >= 0 &&
-          point.x <= overlayBounds.width &&
-          point.y <= overlayBounds.height,
+          point.x <= w &&
+          point.y <= h,
       );
 
-    heatmapInstanceRef.current = null;
-
-    try {
-      const factory = resolveHeatmapFactory();
-      if (!factory) {
-        console.error("Heatmap init failed:", new Error("heatmap.js create export not found"));
-        return;
-      }
-
-      container.innerHTML = "";
-      heatmapInstanceRef.current = factory.create({
-        container,
-        radius: 28,
-        maxOpacity: 0.55,
-        minOpacity: 0.05,
-        blur: 0.9,
-        gradient: {
-          0.25: "#22c55e",
-          0.5: "#eab308",
-          0.75: "#f97316",
-          1: "#ef4444",
-        },
-      }) as HeatmapInstance;
-
-      const instance = heatmapInstanceRef.current;
-      if (instance && typeof instance.setData === "function") {
-        instance.setData({
-          max: 5,
-          min: 0,
-          data: scaledPoints,
-        });
-      }
-    } catch (err) {
-      console.error("Heatmap init failed:", err);
-      heatmapInstanceRef.current = null;
+    if (scaledPoints.length === 0) {
+      return;
     }
 
-    return () => {
-      heatmapInstanceRef.current = null;
-      if (heatmapLayerRef.current) {
-        heatmapLayerRef.current.innerHTML = "";
+    try {
+      ctx.globalCompositeOperation = "source-over";
+      for (const p of scaledPoints) {
+        const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, SPLAT_RADIUS_PX);
+        g.addColorStop(0, "rgba(0, 0, 0, 0.15)");
+        g.addColorStop(1, "rgba(0, 0, 0, 0)");
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, SPLAT_RADIUS_PX, 0, Math.PI * 2);
+        ctx.fill();
       }
-    };
-  }, [points, overlayBounds, layoutTick]);
+
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const d = imgData.data;
+      let maxA = 0;
+      for (let j = 3; j < d.length; j += 4) {
+        if (d[j] > maxA) {
+          maxA = d[j];
+        }
+      }
+      const norm = maxA > 0 ? 255 / maxA : 1;
+
+      for (let i = 0; i < d.length; i += 4) {
+        const aRaw = d[i + 3];
+        if (aRaw === 0) {
+          continue;
+        }
+        const t = Math.min(255, Math.round(aRaw * norm));
+        const rgb = HEAT_RGB_LUT[t]!;
+        d[i] = rgb[0]!;
+        d[i + 1] = rgb[1]!;
+        d[i + 2] = rgb[2]!;
+        d[i + 3] = Math.min(255, t + 35);
+      }
+
+      ctx.putImageData(imgData, 0, 0);
+    } catch (err) {
+      console.error("Heatmap canvas failed:", err);
+    }
+  }, [points, overlayBounds, layoutTick, imageIntrinsicSize]);
 
   return (
-    <div ref={wrapperRef} className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg bg-white">
+    <div
+      ref={wrapperRef}
+      className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg bg-white"
+    >
       <img
         ref={imageRef}
         src={resolvedFloorPlanUrl}
         alt="Floor plan"
-        className="w-full h-full object-contain pointer-events-none p-4"
-        onLoad={() => {
+        className="w-full h-full object-contain pointer-events-none border-0 p-4 outline-none ring-0"
+        onLoad={(e) => {
           setImageError(false);
+          const el = e.currentTarget;
+          const nw = el.naturalWidth || 1920;
+          const nh = el.naturalHeight || 1080;
+          setImageIntrinsicSize({ width: nw, height: nh });
           setLayoutTick((t) => t + 1);
         }}
         onError={() => {
@@ -322,7 +437,6 @@ function AnalyticsHeatmap({
         }}
       />
       <div
-        ref={heatmapLayerRef}
         className="pointer-events-none absolute"
         style={{
           left: `${overlayBounds.left}px`,
@@ -330,7 +444,12 @@ function AnalyticsHeatmap({
           width: `${overlayBounds.width}px`,
           height: `${overlayBounds.height}px`,
         }}
-      />
+      >
+        <canvas
+          ref={heatmapContainerRef}
+          className="pointer-events-none absolute left-0 top-0 block h-full w-full max-w-full border-0 opacity-80 outline-none ring-0"
+        />
+      </div>
       {imageError && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/90 text-sm text-[#846851]">
           Не вдалося завантажити план приміщення.
@@ -368,7 +487,8 @@ export default function Analytics({
   const [isUploadingPlan, setIsUploadingPlan] = useState(false);
   const [dateTab, setDateTab] = useState("today");
   const [customDate, setCustomDate] = useState("");
-  const [timeRange, setTimeRange] = useState("");
+  const [timeStart, setTimeStart] = useState("");
+  const [timeEnd, setTimeEnd] = useState("");
   const [dynamicsView, setDynamicsView] = useState<"hours" | "days">("hours");
 
   const loadStats = async () => {
@@ -383,6 +503,13 @@ export default function Analytics({
           }
         : undefined;
 
+      const timeRangeForApi = timeStart && timeEnd ? `${timeStart} - ${timeEnd}` : "";
+
+      const filterQs = buildAnalyticsSummaryQuery(dateTab, customDate, timeRangeForApi);
+      const filterQuery = filterQs.startsWith("?") ? filterQs.slice(1) : filterQs;
+      const withFilter = (path: string) =>
+        filterQuery ? `${path}${path.includes("?") ? "&" : "?"}${filterQuery}` : path;
+
       const [
         summaryResponse,
         dynamicsResponse,
@@ -392,16 +519,16 @@ export default function Analytics({
         routesResponse,
         heatmapResponse,
       ] = await Promise.all([
-        fetch("http://127.0.0.1:8000/api/analytics/summary", {
+        fetch(`${API_ROOT}/api/analytics/summary${filterQs}`, {
           headers,
         }),
-        fetch(`http://127.0.0.1:8000/api/analytics/dynamics?view=${dynamicsView}`, {
+        fetch(withFilter(`${API_ROOT}/api/analytics/dynamics?view=${encodeURIComponent(dynamicsView)}`), {
           headers,
         }),
-        fetch("http://127.0.0.1:8000/api/analytics/demographics", {
+        fetch(withFilter(`${API_ROOT}/api/analytics/demographics`), {
           headers,
         }),
-        fetch("http://127.0.0.1:8000/api/analytics/history", {
+        fetch(withFilter(`${API_ROOT}/api/analytics/history`), {
           headers,
         }),
         fetch("http://127.0.0.1:8000/api/analytics/zones", {
@@ -457,7 +584,7 @@ export default function Analytics({
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [dateTab, customDate, timeRange, dynamicsView]);
+  }, [dateTab, customDate, timeStart, timeEnd, dynamicsView]);
 
   useEffect(() => {
     const fetchCafe = async () => {
@@ -494,12 +621,14 @@ export default function Analytics({
     }
   }, [externalCafe]);
 
-  const isCustomFilterActive = dateTab !== "today" || Boolean(customDate) || Boolean(timeRange);
+  const isCustomFilterActive =
+    dateTab !== "today" || Boolean(customDate) || Boolean(timeStart || timeEnd);
 
   const resetFilters = () => {
     setDateTab("today");
     setCustomDate("");
-    setTimeRange("");
+    setTimeStart("");
+    setTimeEnd("");
   };
 
   const dynamicsXAxisKey = dynamicsView === "hours" ? "time" : "date";
@@ -515,7 +644,7 @@ export default function Analytics({
     setIsUploadingPlan(true);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/api/cafes/me/floor-plan", {
+      const response = await fetch(`${API_ROOT}/api/cafe/update-floor-plan`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -523,15 +652,19 @@ export default function Analytics({
         body: formData,
       });
 
-      const data = await response.json();
+      const data = await response.json() as { detail?: string; floor_plan_url?: string };
       if (!response.ok) {
         throw new Error(data.detail || "Не вдалося завантажити план приміщення.");
+      }
+      const planUrl = data.floor_plan_url;
+      if (!planUrl) {
+        throw new Error("Сервер не повернув URL плану.");
       }
 
       const nextCafe = {
         name: myCafe?.name || "",
         address: myCafe?.address || "",
-        floor_plan_url: data.floor_plan_url,
+        floor_plan_url: planUrl,
       };
       setMyCafe(nextCafe);
       onCafeUpdate?.(nextCafe);
@@ -568,6 +701,13 @@ export default function Analytics({
     }
   };
 
+  const trendComparisonLabel = summaryComparisonLabel(dateTab, customDate);
+
+  const hasDynamicsData = dynamicsData.some((d) => Number(d.customers) > 0);
+  const hasDemographicData = demographics.some(
+    (row) => Number(row.Чоловіки) > 0 || Number(row.Жінки) > 0,
+  );
+
   return (
     <div className="min-h-full w-full bg-[#f5f3f0] pt-6 font-sans text-[#411e03]">
       <div className="max-w-[1600px] mx-auto w-full">
@@ -586,21 +726,34 @@ export default function Analytics({
                   onValueChange={(value) => {
                     setDateTab(value);
                     setCustomDate("");
-                    setTimeRange("");
+                    setTimeStart("");
+                    setTimeEnd("");
                   }}
                   className="w-auto"
                 >
                   <TabsList className="h-10 border border-slate-200 bg-white shadow-sm">
-                    <TabsTrigger value="today" className="data-[state=active]:bg-slate-100">
+                    <TabsTrigger
+                      value="today"
+                      className="text-slate-600 data-[state=active]:bg-slate-100 data-[state=active]:text-slate-900"
+                    >
                       Сьогодні
                     </TabsTrigger>
-                    <TabsTrigger value="7days" className="data-[state=active]:bg-slate-100">
+                    <TabsTrigger
+                      value="7days"
+                      className="text-slate-600 data-[state=active]:bg-slate-100 data-[state=active]:text-slate-900"
+                    >
                       7 днів
                     </TabsTrigger>
-                    <TabsTrigger value="30days" className="data-[state=active]:bg-slate-100">
+                    <TabsTrigger
+                      value="30days"
+                      className="text-slate-600 data-[state=active]:bg-slate-100 data-[state=active]:text-slate-900"
+                    >
                       30 днів
                     </TabsTrigger>
-                    <TabsTrigger value="all" className="data-[state=active]:bg-slate-100">
+                    <TabsTrigger
+                      value="all"
+                      className="text-slate-600 data-[state=active]:bg-slate-100 data-[state=active]:text-slate-900"
+                    >
                       Весь час
                     </TabsTrigger>
                   </TabsList>
@@ -627,23 +780,42 @@ export default function Analytics({
                       </button>
                     )}
                   </div>
-                  <div className="relative">
-                    <Clock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                    <Input
-                      type="text"
-                      placeholder="00:00 - 23:59"
-                      value={timeRange}
+                  <div
+                    className="flex min-w-[220px] items-center gap-1.5 rounded-md border border-[#d7cdc1] bg-white px-2.5 py-1 shadow-sm focus-within:ring-2 focus-within:ring-[#8a895f]/40"
+                  >
+                    <Clock size={16} className="shrink-0 text-slate-400" aria-hidden />
+                    <input
+                      type="time"
+                      aria-label="Початок інтервалу часу"
+                      value={timeStart}
                       onChange={(event) => {
-                        setTimeRange(event.target.value);
+                        setTimeStart(event.target.value);
                         setDateTab("");
                       }}
-                      className="h-10 w-36 border-[#d7cdc1] bg-white pl-10 pr-8 text-[#411e03] shadow-sm focus-visible:ring-[#8a895f]"
+                      className="h-9 min-w-[5.75rem] flex-1 border-0 bg-transparent text-sm text-[#411e03] outline-none [&::-webkit-calendar-picker-indicator]:opacity-70"
                     />
-                    {timeRange && (
+                    <span className="shrink-0 select-none text-[#846851]" aria-hidden>
+                      –
+                    </span>
+                    <input
+                      type="time"
+                      aria-label="Кінець інтервалу часу"
+                      value={timeEnd}
+                      onChange={(event) => {
+                        setTimeEnd(event.target.value);
+                        setDateTab("");
+                      }}
+                      className="h-9 min-w-[5.75rem] flex-1 border-0 bg-transparent text-sm text-[#411e03] outline-none [&::-webkit-calendar-picker-indicator]:opacity-70"
+                    />
+                    {(timeStart || timeEnd) && (
                       <button
                         type="button"
-                        onClick={() => setTimeRange("")}
-                        className="absolute top-1/2 right-2 -translate-y-1/2 text-[#846851] transition-colors hover:text-[#411e03]"
+                        onClick={() => {
+                          setTimeStart("");
+                          setTimeEnd("");
+                        }}
+                        className="ml-0.5 shrink-0 rounded p-0.5 text-[#846851] transition-colors hover:bg-[#f5f3f0] hover:text-[#411e03]"
+                        aria-label="Очистити час"
                       >
                         <X size={14} />
                       </button>
@@ -652,7 +824,7 @@ export default function Analytics({
                 </div>
               </div>
 
-              <div className="flex items-center gap-3">
+              <div className="flex shrink-0 flex-wrap items-center gap-3">
                 <Button
                   variant="ghost"
                   onClick={resetFilters}
@@ -673,9 +845,9 @@ export default function Analytics({
                 <Button
                   onClick={handleExportPDF}
                   disabled={isExporting}
-                  className="gap-2 bg-emerald-600 text-white shadow-sm hover:bg-emerald-700"
+                  className="h-10 gap-2 border border-transparent bg-[#411e03]/90 px-4 text-white shadow-sm transition-colors [&_svg]:text-[#d6b38d] hover:bg-[#411e03] active:opacity-70 focus-visible:border focus-visible:border-[#d6b38d]/50 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 disabled:opacity-50"
                 >
-                  {isExporting ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
+                  {isExporting ? <RefreshCw size={16} className="animate-spin text-[#d6b38d]" /> : <Download size={16} />}
                   {isExporting ? "Генерація..." : "Експорт"}
                 </Button>
               </div>
@@ -689,18 +861,8 @@ export default function Analytics({
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-[#846851]">Всього клієнтів</p>
-                    <div className="text-2xl font-bold text-[#411e03]">{summary?.total_customers?.value || 0}</div>
-                    {summary?.total_customers?.trend && (
-                      <div
-                        className={`mt-1.5 flex items-center gap-1 text-sm font-medium ${
-                          summary.total_customers.is_positive ? "text-[#8a895f]" : "text-red-500/80"
-                        }`}
-                      >
-                        {summary.total_customers.is_positive ? <TrendingUp size={16} /> : <TrendingDown size={16} />}
-                        <span>{summary.total_customers.trend}%</span>
-                        <span className="ml-1 font-normal text-[#846851]">від учора</span>
-                      </div>
-                    )}
+                    <div className="text-2xl font-bold text-[#411e03]">{summary?.total_clients ?? 0}</div>
+                    <SummaryTrendFootnote trend={summary?.clients_trend ?? null} comparisonLabel={trendComparisonLabel} />
                   </div>
                 </CardContent>
               </Card>
@@ -712,18 +874,10 @@ export default function Analytics({
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-[#846851]">Сер. час перебування</p>
-                    <div className="text-2xl font-bold text-[#411e03]">{summary?.avg_time?.value || "0 хв 0 с"}</div>
-                    {summary?.avg_time?.trend && (
-                      <div
-                        className={`mt-1.5 flex items-center gap-1 text-sm font-medium ${
-                          summary.avg_time.is_positive ? "text-[#8a895f]" : "text-red-500/80"
-                        }`}
-                      >
-                        {summary.avg_time.is_positive ? <TrendingUp size={16} /> : <TrendingDown size={16} />}
-                        <span>{summary.avg_time.trend}%</span>
-                        <span className="ml-1 font-normal text-[#846851]">від учора</span>
-                      </div>
-                    )}
+                    <div className="text-2xl font-bold text-[#411e03]">
+                      {formatDurationUk(summary?.avg_duration_seconds ?? 0)}
+                    </div>
+                    <SummaryTrendFootnote trend={summary?.duration_trend ?? null} comparisonLabel={trendComparisonLabel} />
                   </div>
                 </CardContent>
               </Card>
@@ -735,8 +889,10 @@ export default function Analytics({
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-[#846851]">Година пік</p>
-                    <div className="text-2xl font-bold text-[#411e03]">{summary?.peak_hour?.value || "Unknown"}</div>
-                    <div className="mt-1.5 text-sm text-[#846851]">{summary?.peak_hour?.subtext || ""}</div>
+                    <div className="text-2xl font-bold text-[#411e03]">{summary?.peak_hour ?? "Немає даних"}</div>
+                    {summary?.peak_hour != null && summary.peak_clients != null ? (
+                      <div className="mt-1.5 text-sm text-[#846851]">{summary.peak_clients} клієнтів</div>
+                    ) : null}
                   </div>
                 </CardContent>
               </Card>
@@ -765,15 +921,29 @@ export default function Analytics({
                     }}
                   />
                   {myCafe?.floor_plan_url ? (
-                    <div className="relative mx-auto flex h-[500px] w-full max-w-[800px] items-center justify-center overflow-hidden rounded-lg bg-white shadow-inner">
-                      <AnalyticsHeatmap floorPlanUrl={myCafe.floor_plan_url} points={heatmapPoints} />
-                      <button
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        className="absolute top-3 right-3 rounded-md bg-white/90 px-3 py-1.5 text-xs font-medium text-[#411e03] shadow-sm transition hover:bg-white"
-                      >
-                        {isUploadingPlan ? "Завантаження..." : "Змінити план"}
-                      </button>
+                    <div className="mx-auto flex w-full max-w-[880px] flex-row items-center gap-6 mt-4">
+                      <div className="flex h-[280px] shrink-0 flex-col items-center justify-between">
+                        <span className="w-16 text-center text-xs font-medium text-[#846851]">
+                          Більше людей
+                        </span>
+
+                        <div className="my-3 w-4 flex-1 rounded-full border border-[#d7cdc1]/50 bg-[linear-gradient(to_bottom,#ef4444,#eab308,#22c55e,#3b82f6)] shadow-inner" />
+
+                        <span className="w-16 text-center text-xs font-medium text-[#846851]">
+                          Менше людей
+                        </span>
+                      </div>
+
+                      <div className="relative flex h-[500px] min-w-0 flex-1 items-center justify-center overflow-hidden rounded-lg bg-white shadow-inner">
+                        <AnalyticsHeatmap floorPlanUrl={myCafe.floor_plan_url} points={heatmapPoints} />
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          className="absolute top-3 right-3 rounded-md bg-white/90 px-3 py-1.5 text-xs font-medium text-[#411e03] shadow-sm transition hover:bg-white"
+                        >
+                          {isUploadingPlan ? "Завантаження..." : "Змінити план"}
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <button
@@ -841,7 +1011,7 @@ export default function Analytics({
               <Card className="border-[#d7cdc1] bg-white shadow-sm lg:col-span-2">
                 <CardHeader className="flex flex-col gap-4 p-5 pb-4 sm:flex-row sm:items-center sm:justify-between">
                   <CardTitle className="flex items-center gap-2 text-lg font-semibold text-[#411e03]">
-                    <TrendingUp size={18} className="text-emerald-500" />
+                    <TrendingUp size={18} className="text-[#659b4c]" />
                     Динаміка відвідуваності
                   </CardTitle>
                   <Tabs
@@ -850,10 +1020,16 @@ export default function Analytics({
                     className="w-auto"
                   >
                     <TabsList className="h-9 border border-[#d7cdc1] bg-[#f5f3f0] shadow-sm">
-                      <TabsTrigger value="hours" className="text-[#846851] data-[state=active]:bg-[#411e03] data-[state=active]:text-white">
+                      <TabsTrigger
+                        value="hours"
+                        className="text-[#846851] data-[state=active]:bg-slate-100 data-[state=active]:text-[#411e03]"
+                      >
                         Години
                       </TabsTrigger>
-                      <TabsTrigger value="days" className="text-[#846851] data-[state=active]:bg-[#411e03] data-[state=active]:text-white">
+                      <TabsTrigger
+                        value="days"
+                        className="text-[#846851] data-[state=active]:bg-slate-100 data-[state=active]:text-[#411e03]"
+                      >
                         Дні
                       </TabsTrigger>
                     </TabsList>
@@ -861,7 +1037,7 @@ export default function Analytics({
                 </CardHeader>
                 <CardContent className="px-5 pb-5 pt-0">
                   <div className="h-64 min-h-[256px] w-full">
-                    {dynamicsData.length > 0 ? (
+                    {hasDynamicsData ? (
                       <ResponsiveContainer width="100%" height="100%">
                         <LineChart data={dynamicsData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
                           <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
@@ -884,10 +1060,10 @@ export default function Analytics({
                             type="monotone"
                             dataKey="customers"
                             name="Клієнти"
-                            stroke="#10b981"
+                            stroke="#659b4c"
                             strokeWidth={3}
-                            dot={{ r: 4, fill: "#10b981", strokeWidth: 2 }}
-                            activeDot={{ r: 6 }}
+                            dot={{ r: 4, fill: "#659b4c", stroke: "#ffffff", strokeWidth: 2 }}
+                            activeDot={{ r: 6, fill: "#659b4c", stroke: "#ffffff", strokeWidth: 2 }}
                           />
                         </LineChart>
                       </ResponsiveContainer>
@@ -906,7 +1082,7 @@ export default function Analytics({
                 </CardHeader>
                 <CardContent className="px-5 pb-5 pt-0">
                   <div className="h-64 min-h-[256px] w-full">
-                    {demographics.length > 0 ? (
+                    {hasDemographicData ? (
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart data={demographics} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
                           <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
@@ -962,16 +1138,24 @@ export default function Analytics({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#d7cdc1]/30">
-                      {historyData.map((row, idx) => (
-                        <tr key={idx} className="text-[#411e03] transition-colors hover:bg-slate-50">
-                          <td className="px-6 py-4 font-medium">{row.date}</td>
-                          <td className="px-6 py-4">{row.total}</td>
-                          <td className="px-6 py-4 text-[#8a895f]">{row.avg_time}</td>
-                          <td className="px-6 py-4">{row.peak}</td>
-                          <td className="px-6 py-4">{row.gender}</td>
-                          <td className="px-6 py-4">{row.top_age}</td>
+                      {historyData.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="px-6 py-10 text-center text-sm text-[#846851]">
+                            Немає даних за обраний період
+                          </td>
                         </tr>
-                      ))}
+                      ) : (
+                        historyData.map((row, idx) => (
+                          <tr key={`${row.date}-${idx}`} className="text-[#411e03] transition-colors hover:bg-slate-50">
+                            <td className="px-6 py-4 font-medium">{row.date}</td>
+                            <td className="px-6 py-4">{row.total}</td>
+                            <td className="px-6 py-4 text-[#8a895f]">{row.avg_time}</td>
+                            <td className="px-6 py-4">{row.peak}</td>
+                            <td className="px-6 py-4">{row.gender}</td>
+                            <td className="px-6 py-4">{row.top_age}</td>
+                          </tr>
+                        ))
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -991,7 +1175,10 @@ export default function Analytics({
                 </CardHeader>
                 <CardContent className="px-5 pb-5 pt-0">
                   <div className="space-y-6">
-                    {routesData.map((route, idx) => (
+                    {routesData.length === 0 ? (
+                      <p className="py-6 text-center text-sm text-[#846851]">Немає даних про маршрути</p>
+                    ) : (
+                      routesData.map((route, idx) => (
                       <div key={idx} className="group">
                         <div className="mb-2 flex items-center justify-between">
                           <div className="flex items-center gap-3">
@@ -1011,7 +1198,8 @@ export default function Analytics({
                           />
                         </div>
                       </div>
-                    ))}
+                      ))
+                    )}
                   </div>
 
                   <button className="mt-8 flex items-center gap-1 text-sm font-bold text-[#8a895f] transition-colors hover:text-[#411e03]">

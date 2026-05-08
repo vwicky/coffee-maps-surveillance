@@ -9,3 +9,10 @@ body,
 body {
   margin: 0;
 }
+
+/* Cocoa focus frame for floor-plan stacks (overrides browser purple/blue focus rings). */
+svg:focus,
+img:focus,
+.map-container:focus {
+  outline: 2px solid #411e03 !important;
+}
